@@ -44,7 +44,8 @@ DEFAULTS = {
     "augment": True,
     "holdout": 0.1,
     "seed": 3407,
-    "loss": {"brier": 1.0, "ordinal": 0.5, "hard": False},
+    "select_by": "kl",  # best epoch by val "kl" (lower) or "acc" (higher)
+    "loss": {"brier": 1.0, "ordinal": 0.5, "hard_weight": 0.0},
     "head": {"d": 512, "heads": 8, "n_cross": 2, "n_joint": 2, "dropout": 0.1},
     "lora": {"r": 16, "alpha": 32, "dropout": 0.05},
 }
@@ -154,7 +155,7 @@ def main():
 
     log = (run_dir / "log.jsonl").open("w")
     step, micro, t0 = 0, 0, time.time()
-    best_kl, best_state = float("inf"), None
+    best_score, best_state = float("-inf"), None
     pbar = tqdm(total=total, desc=cfg["name"])
     epoch = 0
     while step < total:
@@ -189,8 +190,9 @@ def main():
         print(f"\nepoch {epoch} step {step}: val acc {val['acc']:.3f}  annot_agree {val['annot_agree']:.3f}  kl {val['kl']:.3f}  ece {val['ece']:.3f}", flush=True)
         log.write(json.dumps({"step": step, "epoch": epoch, "val": val}) + "\n")
         log.flush()
-        if val["kl"] < best_kl:
-            best_kl, best_state = val["kl"], model.trainable_state_dict()
+        score = -val["kl"] if cfg["select_by"] == "kl" else val["acc"]
+        if score > best_score:
+            best_score, best_state = score, model.trainable_state_dict()
     pbar.close()
 
     model.load_state_dict(best_state, strict=False)

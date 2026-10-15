@@ -1,0 +1,6 @@
+# Full fine-tune, 5 epochs, soft targets (isolates the effect of more epochs vs configs/full.yaml).
+name: full_e5
+mode: full
+epochs: 5
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4

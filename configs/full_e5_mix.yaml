@@ -1,0 +1,8 @@
+# Full fine-tune, 5 epochs, target = 0.5 * annotator distribution + 0.5 * one-hot gold label.
+name: full_e5_mix
+mode: full
+epochs: 5
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4
+loss: {hard_weight: 0.5}
+select_by: acc
