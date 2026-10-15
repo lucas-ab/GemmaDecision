@@ -1,0 +1,210 @@
+"""`gd-train configs/full.yaml` - train a decision model, calibrate on the holdout, evaluate on test.
+
+Outputs in runs/<name>/: config.yaml, trainable.safetensors (only weights that differ from the base
+checkpoint), log.jsonl, eval_val.json, eval_test.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import torch
+import yaml
+from safetensors.torch import load_file, save_file
+from tqdm import tqdm
+
+from .data import collate, encode, length_bucketed_batches, load_examples, split_holdout
+from .evaluate import fit_temperatures, format_report, report, run
+from .losses import decision_loss
+from .model import MODEL_ID, ClefHead, DecisionModel, load_encoder, to_device
+
+DEFAULTS = {
+    "name": "run",
+    "mode": "full",
+    "model_id": MODEL_ID,
+    "dataset": "LocalLLaMA/typed-decisions",
+    "dataset_config": "all",
+    "max_length": 1024,
+    "batch_size": 4,
+    "grad_accum": 2,
+    "gradient_checkpointing": True,
+    "mps_memory_fraction": 0.75,  # fail fast with OOM instead of swapping the machine
+    "epochs": 3,
+    "max_steps": None,
+    "lr_encoder": 2e-5,
+    "lr_head": 1e-4,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.06,
+    "grad_clip": 1.0,
+    "augment": True,
+    "holdout": 0.1,
+    "seed": 3407,
+    "loss": {"brier": 1.0, "ordinal": 0.5, "hard": False},
+    "head": {"d": 512, "heads": 8, "n_cross": 2, "n_joint": 2, "dropout": 0.1},
+    "lora": {"r": 16, "alpha": 32, "dropout": 0.05},
+}
+
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def load_config(path: Path) -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    for k, v in (yaml.safe_load(path.read_text()) or {}).items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+
+def build_model(cfg: dict) -> DecisionModel:
+    encoder = load_encoder(cfg["mode"], cfg["model_id"], cfg["lora"])
+    if cfg.get("gradient_checkpointing") and cfg["mode"] != "frozen":
+        encoder.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    head = ClefHead(d_in=encoder.config.text_config.embedding_dim, **cfg["head"])
+    return DecisionModel(encoder, head, cfg["mode"])
+
+
+def load_checkpoint(run_dir: Path):
+    from transformers import AutoTokenizer
+
+    cfg = yaml.safe_load((run_dir / "config.yaml").read_text())
+    model = build_model(cfg)
+    missing, unexpected = model.load_state_dict(load_file(run_dir / "trainable.safetensors"), strict=False)
+    if unexpected:
+        raise RuntimeError(f"unexpected keys in checkpoint: {unexpected[:5]}")
+    device = pick_device()
+    return model.to(device), AutoTokenizer.from_pretrained(cfg["model_id"]), cfg, device
+
+
+def param_groups(model: DecisionModel, cfg: dict):
+    groups = []
+    for module, lr in ((model.encoder, cfg["lr_encoder"]), (model.head, cfg["lr_head"])):
+        decay, no_decay = [], []
+        for n, p in module.named_parameters():
+            if p.requires_grad:
+                (no_decay if p.ndim < 2 or "norm" in n or "emb" in n else decay).append(p)
+        groups += [
+            {"params": decay, "lr": lr, "weight_decay": cfg["weight_decay"]},
+            {"params": no_decay, "lr": lr, "weight_decay": 0.0},
+        ]
+    return [g for g in groups if g["params"]]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config", type=Path)
+    ap.add_argument("--max-steps", type=int, help="override config (for smoke tests)")
+    ap.add_argument("--name", help="override run name")
+    ap.add_argument("--limit", type=int, help="use only N train / N//4 eval rows (smoke tests)")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.max_steps:
+        cfg["max_steps"] = args.max_steps
+    if args.name:
+        cfg["name"] = args.name
+    run_dir = Path("runs") / cfg["name"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+    random.seed(cfg["seed"])
+    torch.manual_seed(cfg["seed"])
+    rng = random.Random(cfg["seed"])
+    device = pick_device()
+    if device.type == "mps" and cfg.get("mps_memory_fraction"):
+        torch.mps.set_per_process_memory_fraction(cfg["mps_memory_fraction"])
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model_id"])
+    train_ex, val_ex = split_holdout(load_examples(cfg["dataset"], cfg["dataset_config"], "train"), cfg["holdout"], cfg["seed"])
+    test_ex = load_examples(cfg["dataset"], cfg["dataset_config"], "test")
+    if args.limit:
+        train_ex, val_ex, test_ex = train_ex[: args.limit], val_ex[: args.limit // 4], test_ex[: args.limit // 4]
+    print(f"train {len(train_ex)}  val {len(val_ex)}  test {len(test_ex)}  device {device}")
+
+    model = build_model(cfg).to(device)
+    n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    n_head = sum(p.numel() for p in model.head.parameters())
+    print(f"mode={cfg['mode']}  trainable encoder {n_enc / 1e6:.1f}M  head {n_head / 1e6:.1f}M")
+
+    lengths = [len(encode(tokenizer, ex.state, ex.questions, cfg["max_length"]).input_ids) for ex in train_ex]
+    steps_per_epoch = math.ceil(len(train_ex) / cfg["batch_size"] / cfg["grad_accum"])
+    total = cfg["max_steps"] or steps_per_epoch * cfg["epochs"]
+    warmup = max(1, int(total * cfg["warmup_ratio"]))
+    opt = torch.optim.AdamW(param_groups(model, cfg))
+    base_lrs = [g["lr"] for g in opt.param_groups]
+
+    def set_lr(step):
+        f = step / warmup if step < warmup else 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total - warmup)))
+        for g, lr in zip(opt.param_groups, base_lrs):
+            g["lr"] = lr * f
+
+    log = (run_dir / "log.jsonl").open("w")
+    step, micro, t0 = 0, 0, time.time()
+    best_kl, best_state = float("inf"), None
+    pbar = tqdm(total=total, desc=cfg["name"])
+    epoch = 0
+    while step < total:
+        model.train()
+        for idx in length_bucketed_batches(lengths, cfg["batch_size"], rng):
+            enc = [encode(tokenizer, train_ex[i].state, train_ex[i].questions, cfg["max_length"],
+                          rng if cfg["augment"] else None) for i in idx]
+            batch = collate(enc, tokenizer.pad_token_id)
+            batch.pop("q_meta")
+            batch = to_device(batch, device)
+            loss, parts = decision_loss(model(batch, calibrated=False), batch, **cfg["loss"])
+            (loss / cfg["grad_accum"]).backward()
+            micro += 1
+            if micro % cfg["grad_accum"]:
+                continue
+            set_lr(step)
+            torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], cfg["grad_clip"])
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            step += 1
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss.item():.3f}")
+            if step % 10 == 0:
+                log.write(json.dumps({"step": step, "epoch": epoch, "loss": loss.item(), **parts,
+                                      "elapsed_s": round(time.time() - t0)}) + "\n")
+                log.flush()
+            if step >= total:
+                break
+        epoch += 1
+        # Validate at each epoch end (and at the end of a max_steps run); keep the best by KL to gold.
+        val = report(run(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], calibrated=False)[0])["overall"]
+        print(f"\nepoch {epoch} step {step}: val acc {val['acc']:.3f}  annot_agree {val['annot_agree']:.3f}  kl {val['kl']:.3f}  ece {val['ece']:.3f}", flush=True)
+        log.write(json.dumps({"step": step, "epoch": epoch, "val": val}) + "\n")
+        log.flush()
+        if val["kl"] < best_kl:
+            best_kl, best_state = val["kl"], model.trainable_state_dict()
+    pbar.close()
+
+    model.load_state_dict(best_state, strict=False)
+    temps = fit_temperatures(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"])
+    print(f"temperatures (choice, noul, score): {[round(t, 3) for t in temps]}")
+    save_file({k: v.contiguous() for k, v in model.trainable_state_dict().items()}, run_dir / "trainable.safetensors")
+
+    for split, exs in (("val", val_ex), ("test", test_ex)):
+        res = report(run(model, tokenizer, exs, device, cfg["batch_size"], cfg["max_length"])[0])
+        res["meta"] = {"train_minutes": round((time.time() - t0) / 60, 1), "steps": step, "temperatures": temps,
+                       "trainable_encoder_params": n_enc, "head_params": n_head}
+        (run_dir / f"eval_{split}.json").write_text(json.dumps(res, indent=2))
+        print(f"\n== {split} ==\n" + format_report({k: v for k, v in res.items() if k != "meta"}))
+
+
+if __name__ == "__main__":
+    main()

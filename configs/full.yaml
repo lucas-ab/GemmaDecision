@@ -1,0 +1,7 @@
+# Full fine-tune of the text backbone (24 layers + PLE + norm + 512->768 projection).
+# Token embeddings, vision and audio towers stay frozen.
+name: full
+mode: full
+epochs: 3
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4

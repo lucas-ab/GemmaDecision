@@ -30,3 +30,8 @@ dev = [
     "modal>=1.6",
     "pytest>=9.1.1",
 ]
+
+[project.scripts]
+gd-train = "gemma_decision.train:main"
+gd-eval = "gemma_decision.evaluate:main"
+gd-compare = "gemma_decision.compare:main"

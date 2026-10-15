@@ -1,0 +1,7 @@
+# LoRA on every attention and MLP linear of the 24 text layers; base weights frozen.
+name: lora
+mode: lora
+epochs: 3
+lr_encoder: 2.0e-4
+lr_head: 1.0e-4
+lora: {r: 16, alpha: 32, dropout: 0.05}

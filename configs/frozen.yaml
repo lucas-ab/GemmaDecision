@@ -1,0 +1,5 @@
+# Floor: encoder frozen, only the Clef head trains.
+name: frozen
+mode: frozen
+epochs: 3
+lr_head: 3.0e-4
