@@ -34,6 +34,7 @@ DEFAULTS = {
     "grad_accum": 2,
     "gradient_checkpointing": True,
     "mps_memory_fraction": 0.75,  # fail fast with OOM instead of swapping the machine
+    "amp": "auto",  # "auto" = bf16 autocast on CUDA, fp32 elsewhere; "bf16" | "fp32" to force (never fp16)
     "epochs": 3,
     "max_steps": None,
     "lr_encoder": 2e-5,
@@ -67,6 +68,23 @@ def load_config(path: Path) -> dict:
         else:
             cfg[k] = v
     return cfg
+
+
+def apply_overrides(cfg: dict, pairs: list[str]) -> dict:
+    """`key=value` or `section.key=value`; values parsed as YAML (numbers, bools, lists)."""
+    for pair in pairs:
+        key, _, raw = pair.partition("=")
+        target = cfg
+        *parents, leaf = key.split(".")
+        for p in parents:
+            target = target.setdefault(p, {})
+        target[leaf] = yaml.safe_load(raw)
+    return cfg
+
+
+def autocast(cfg: dict, device: torch.device):
+    use_bf16 = cfg.get("amp") == "bf16" or (cfg.get("amp", "auto") == "auto" and device.type == "cuda")
+    return torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16)
 
 
 def build_model(cfg: dict) -> DecisionModel:
@@ -109,9 +127,11 @@ def main():
     ap.add_argument("--max-steps", type=int, help="override config (for smoke tests)")
     ap.add_argument("--name", help="override run name")
     ap.add_argument("--limit", type=int, help="use only N train / N//4 eval rows (smoke tests)")
+    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="override config values, e.g. batch_size=16 grad_accum=1 loss.hard_weight=0.2")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = apply_overrides(load_config(args.config), args.set)
     if args.max_steps:
         cfg["max_steps"] = args.max_steps
     if args.name:
@@ -130,7 +150,8 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_id"])
-    train_ex, val_ex = split_holdout(load_examples(cfg["dataset"], cfg["dataset_config"], "train"), cfg["holdout"], cfg["seed"])
+    train_ex, val_ex = split_holdout(load_examples(cfg["dataset"], cfg["dataset_config"], "train"), cfg["holdout"],
+                                     cfg.get("split_seed", 3407))  # fixed across training seeds
     test_ex = load_examples(cfg["dataset"], cfg["dataset_config"], "test")
     if args.limit:
         train_ex, val_ex, test_ex = train_ex[: args.limit], val_ex[: args.limit // 4], test_ex[: args.limit // 4]
@@ -166,7 +187,9 @@ def main():
             batch = collate(enc, tokenizer.pad_token_id)
             batch.pop("q_meta")
             batch = to_device(batch, device)
-            loss, parts = decision_loss(model(batch, calibrated=False), batch, **cfg["loss"])
+            with autocast(cfg, device):
+                logits = model(batch, calibrated=False)
+            loss, parts = decision_loss(logits.float(), batch, **cfg["loss"])
             (loss / cfg["grad_accum"]).backward()
             micro += 1
             if micro % cfg["grad_accum"]:
@@ -180,7 +203,7 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.3f}")
             if step % 10 == 0:
                 log.write(json.dumps({"step": step, "epoch": epoch, "loss": loss.item(), **parts,
-                                      "elapsed_s": round(time.time() - t0)}) + "\n")
+                                      "elapsed_s": round(time.time() - t0, 2)}) + "\n")
                 log.flush()
             if step >= total:
                 break
