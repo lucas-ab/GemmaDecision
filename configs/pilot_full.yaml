@@ -6,6 +6,7 @@ epochs: 5
 max_length: 3072          # Belebele passages up to ~90 s = 3 x 750 audio tokens
 lr_encoder: 2.0e-5
 lr_head: 1.0e-4
+select_by: typed_kl       # pilot rows are one-hot: their KL would pick an early, under-confident epoch
 mix:
   pilot_dir: data/pilot
   sources: null           # all built sources

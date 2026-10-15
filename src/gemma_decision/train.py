@@ -49,7 +49,7 @@ DEFAULTS = {
     "augment": True,
     "holdout": 0.1,
     "seed": 3407,
-    "select_by": "kl",  # best epoch by val "kl" (lower) or "acc" (higher)
+    "select_by": "kl",  # best epoch by val "kl" (lower), "acc" (higher), or "typed_kl" (KL on typed-decisions val rows only)
     # Extra training data from gd-pilot-build (None = typed-decisions only). Example:
     # mix: {pilot_dir: data/pilot, sources: null, typed_repeat: 3, holdout: 0.05,
     #       weights: {media: 0.5, both: 0.3, text: 0.2}}
@@ -163,6 +163,7 @@ def main():
                                      cfg.get("split_seed", 3407))  # fixed across training seeds
     test_ex = load_examples(cfg["dataset"], cfg["dataset_config"], "test")
     pilot_test, processor, weights = [], None, {}
+    typed_val_ids = {ex.id for ex in val_ex}
     if cfg.get("mix"):
         from transformers import AutoProcessor
 
@@ -258,12 +259,16 @@ def main():
                 break
         epoch += 1
         # Validate at each epoch end (and at the end of a max_steps run); keep the best by KL to gold.
-        val = report(run(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], calibrated=False,
-                         processor=processor)[0])["overall"]
+        val_records = run(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], calibrated=False,
+                          processor=processor)[0]
+        val = report(val_records)["overall"]
+        # typed-decisions rows carry soft annotator distributions; pilot rows are mostly one-hot, so their KL
+        # rewards under-confidence and must not pick the epoch
+        val["typed_kl"] = report([r for r in val_records if r["id"] in typed_val_ids] or val_records)["overall"]["kl"]
         print(f"\nepoch {epoch} step {step}: val acc {val['acc']:.3f}  annot_agree {val['annot_agree']:.3f}  kl {val['kl']:.3f}  ece {val['ece']:.3f}", flush=True)
         log.write(json.dumps({"step": step, "epoch": epoch, "val": val, "skipped": skipped}) + "\n")
         log.flush()
-        score = -val["kl"] if cfg["select_by"] == "kl" else val["acc"]
+        score = {"kl": -val["kl"], "typed_kl": -val["typed_kl"], "acc": val["acc"]}[cfg["select_by"]]
         if score > best_score:
             best_score, best_state = score, model.trainable_state_dict()
     pbar.close()
