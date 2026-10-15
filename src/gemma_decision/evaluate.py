@@ -22,19 +22,26 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from .data import TYPES, collate, encode
+from .data import TYPES, collate, collate_mm, encode, media_reserve
 from .model import probabilities, to_device
 
 
 @torch.no_grad()
-def run(model, tokenizer, examples, device, batch_size: int = 8, max_length: int = 1024, calibrated: bool = True):
-    """Returns (records, logits list). One record per question."""
+def run(
+    model, tokenizer, examples, device, batch_size: int = 8, max_length: int = 1024, calibrated: bool = True,
+    processor=None,
+):
+    """Returns (records, logits list). One record per question. Pass `processor` for examples with media."""
     model.eval()
     records, all_logits = [], []
     for i in range(0, len(examples), batch_size):
         chunk = examples[i : i + batch_size]
-        enc = [encode(tokenizer, ex.state, ex.questions, max_length) for ex in chunk]
-        batch = collate(enc, tokenizer.pad_token_id)
+        has_media = any(ex.images or ex.audio for ex in chunk)
+        if has_media and processor is None:
+            raise ValueError("examples contain images/audio; pass processor=")
+        enc = [encode(tokenizer, ex.state, ex.questions, max_length, reserve=media_reserve(ex) if has_media else 0)
+               for ex in chunk]
+        batch = collate_mm(enc, chunk, processor) if has_media else collate(enc, tokenizer.pad_token_id)
         meta = batch.pop("q_meta")
         logits = model(to_device(batch, device), calibrated=calibrated).float().cpu()
         probs = probabilities(logits)

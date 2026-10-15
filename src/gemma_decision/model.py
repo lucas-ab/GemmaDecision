@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .data import KIND_PAD, TYPES
+from .data import KIND_PAD, MM_KEYS, TYPES
 
 MODEL_ID = "google/embeddinggemma-2"
 LORA_TARGETS = r".*language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
@@ -128,7 +128,8 @@ class DecisionModel(nn.Module):
                 return self.encoder(input_ids=input_ids, attention_mask=attention_mask, **mm).last_hidden_state
         return self.encoder(input_ids=input_ids, attention_mask=attention_mask, **mm).last_hidden_state
 
-    def forward(self, batch, calibrated: bool = True, **mm):
+    def forward(self, batch, calibrated: bool = True):
+        mm = {k: batch[k] for k in MM_KEYS if k in batch}
         tokens = self.encode_tokens(batch["input_ids"], batch["attention_mask"], **mm)
         return self.head(tokens, batch["attention_mask"], batch, calibrated=calibrated)
 

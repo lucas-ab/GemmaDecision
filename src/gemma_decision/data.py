@@ -41,8 +41,10 @@ class Question:
 class Example:
     id: str
     workflow: str
-    state: str
+    state: str  # may contain <|image|> / <|audio|> placeholders, filled in order from images / audio
     questions: list[Question] = field(default_factory=list)
+    images: list = field(default_factory=list)  # PIL images
+    audio: list = field(default_factory=list)  # float32 arrays at 16 kHz
 
 
 def parse_questions(questions: dict, gold: dict | None = None, agreement: dict | None = None) -> list[Question]:
@@ -112,6 +114,7 @@ def split_holdout(examples: list[Example], frac: float = 0.1, seed: int = 3407) 
 
 @dataclass
 class Encoded:
+    text: str
     input_ids: list[int]
     # One entry per question, in serialized order:
     #   (question token span, [option token spans]) with spans as (start, end) token indices.
@@ -157,9 +160,13 @@ def _char_to_token_span(offsets: list[tuple[int, int]], span: tuple[int, int]) -
 
 def encode(
     tokenizer, state: str, questions: list[Question], max_length: int = 1024,
-    rng: random.Random | None = None,
+    rng: random.Random | None = None, reserve: int = 0,
 ) -> Encoded:
-    """Serialize one decision request. With `rng`, question order and choice/noul option order are shuffled."""
+    """Serialize one decision request. With `rng`, question order and choice/noul option order are shuffled.
+
+    `reserve` = tokens that media placeholders will expand into (each placeholder counts as 1 here).
+    """
+    max_length -= reserve
     questions = list(questions)
     if rng is not None:
         rng.shuffle(questions)
@@ -181,6 +188,8 @@ def encode(
         cut = max(overflow * 3, 16)  # ~3+ chars per token
         if cut >= len(state):
             raise ValueError("questions alone exceed max_length")
+        if "<|" in state[-cut - 8 :]:
+            raise ValueError("truncation would cut a media placeholder; raise max_length")
         state = state[:-cut]
 
     offsets = enc["offset_mapping"]
@@ -188,7 +197,7 @@ def encode(
         (_char_to_token_span(offsets, qs), [_char_to_token_span(offsets, os) for os in opts])
         for qs, opts in char_spans
     ]
-    return Encoded(enc["input_ids"], spans, questions)
+    return Encoded(text, enc["input_ids"], spans, questions)
 
 
 # --------------------------------------------------------------------------- batching
@@ -273,4 +282,95 @@ def length_bucketed_batches(lengths: list[int], batch_size: int, rng: random.Ran
         batches += [chunk[k : k + batch_size] for k in range(0, len(chunk), batch_size)]
     rng.shuffle(batches)
     return batches
+
+
+# --------------------------------------------------------------------------- multimodal
+
+MM_KEYS = ("pixel_values", "image_position_ids", "input_features", "input_features_mask")
+AUDIO_TOKENS_PER_S = 25
+IMAGE_TOKENS = 282  # 280 soft tokens + begin/end markers (upper bound; aspect ratio can lower it)
+
+
+def media_reserve(ex: Example) -> int:
+    audio_s = sum(len(a) / 16000 for a in ex.audio)
+    return IMAGE_TOKENS * len(ex.images) + int(AUDIO_TOKENS_PER_S * audio_s) + 2 * len(ex.audio) + 8
+
+
+def _expand_spans(tokenizer, tok_ids: list[int], proc_ids: list[int], spans):
+    """Map token spans computed on placeholder text onto the processor's expanded sequence.
+
+    The processor replaces each placeholder (<|image|>) with <|image> + N soft tokens + <image|>;
+    every other token is unchanged.
+    """
+    conv = tokenizer.convert_tokens_to_ids
+    placeholder_to_end = {conv("<|image|>"): conv("<image|>"), conv("<|audio|>"): conv("<audio|>"), conv("<|video|>"): conv("<video|>")}
+    mapping, j = [], 0
+    for t in tok_ids:
+        if t in placeholder_to_end:
+            end = placeholder_to_end[t]
+            while proc_ids[j] != end:
+                j += 1
+            j += 1
+            mapping.append(None)
+        else:
+            if proc_ids[j] != t:
+                raise ValueError(f"processor/tokenizer mismatch at {j}: {proc_ids[j]} != {t}")
+            mapping.append(j)
+            j += 1
+    remap = lambda span: (mapping[span[0]], mapping[span[1] - 1] + 1)  # noqa: E731
+    return [(remap(qs), [remap(o) for o in opts]) for qs, opts in spans]
+
+
+def _pad_cat(tensors: list[torch.Tensor], value) -> torch.Tensor:
+    """Concatenate along dim 0, right-padding dim 1 to the longest."""
+    n = max(t.shape[1] for t in tensors)
+    padded = []
+    for t in tensors:
+        pad = [0, 0] * (t.ndim - 2) + [0, n - t.shape[1]]
+        padded.append(torch.nn.functional.pad(t, pad, value=value))
+    return torch.cat(padded)
+
+
+def collate_mm(encoded: list[Encoded], examples: list[Example], processor) -> dict:
+    """Like `collate`, but runs the processor so placeholders become image / audio soft tokens."""
+    tokenizer = processor.tokenizer
+    remapped, media = [], {k: [] for k in MM_KEYS}
+    for e, ex in zip(encoded, examples):
+        out = processor(
+            text=e.text, images=ex.images or None, audio=ex.audio or None, return_tensors="pt",
+        )
+        ids = out["input_ids"][0].tolist()
+        remapped.append(Encoded(e.text, ids, _expand_spans(tokenizer, e.input_ids, ids, e.spans), e.questions))
+        for k in MM_KEYS:
+            if k in out:
+                media[k].append(out[k])
+    batch = collate(remapped, tokenizer.pad_token_id)
+    pad_values = {"pixel_values": 0.0, "image_position_ids": -1, "input_features": 0.0, "input_features_mask": False}
+    for k, ts in media.items():
+        if ts:
+            batch[k] = _pad_cat(ts, pad_values[k])
+    return batch
+
+
+def load_mm_examples(root, split: str = "test", variant: str = "both", workflows: list[str] | None = None) -> list[Example]:
+    """Load the multimodal set built by `gd-mm-build`. variant: text | media | both."""
+    import io
+    from pathlib import Path
+
+    import numpy as np
+    import pyarrow.parquet as pq
+    import soundfile as sf
+    from PIL import Image
+
+    out = []
+    for path in sorted(Path(root, split).glob("*.parquet")):
+        if workflows and path.stem not in workflows:
+            continue
+        for row in pq.read_table(path).to_pylist():
+            ex = row_to_example({**row, "state": row[f"state_{variant}"]})
+            if variant != "text":
+                ex.images = [Image.open(io.BytesIO(b)).convert("RGB") for b in row["images"]]
+                ex.audio = [sf.read(io.BytesIO(b), dtype="float32")[0].astype(np.float32) for b in row["audio"]]
+            out.append(ex)
+    return out
 

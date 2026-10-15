@@ -35,3 +35,6 @@ dev = [
 gd-train = "gemma_decision.train:main"
 gd-eval = "gemma_decision.evaluate:main"
 gd-compare = "gemma_decision.compare:main"
+gd-mm-build = "gemma_decision.mm_build:main"
+gd-mm-eval = "gemma_decision.mm_eval:main"
+gd-mm-probe = "gemma_decision.mm_probe:main"
