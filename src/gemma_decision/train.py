@@ -54,6 +54,7 @@ DEFAULTS = {
     # mix: {pilot_dir: data/pilot, sources: null, typed_repeat: 3, holdout: 0.05,
     #       weights: {media: 0.5, both: 0.3, text: 0.2}}
     "mix": None,
+    "init_from": None,  # a run dir (or .safetensors) whose trained weights start this run
     "loss": {"brier": 1.0, "ordinal": 0.5, "hard_weight": 0.0},
     "head": {"d": 512, "heads": 8, "n_cross": 2, "n_joint": 2, "dropout": 0.1},
     "lora": {"r": 16, "alpha": 32, "dropout": 0.05},
@@ -181,6 +182,12 @@ def main():
     print(f"train {len(train_ex)}  val {len(val_ex)}  test {len(test_ex)}  pilot test {len(pilot_test)}  device {device}")
 
     model = build_model(cfg).to(device)
+    if cfg.get("init_from"):
+        src = Path(cfg["init_from"])
+        src = src / "trainable.safetensors" if src.is_dir() else src
+        missing, unexpected = model.load_state_dict(load_file(src), strict=False)
+        print(f"init_from {src}: loaded, {len(unexpected)} unexpected keys")
+        model.head.log_temp.zero_()  # temperatures are refitted at the end of this run
     n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     n_head = sum(p.numel() for p in model.head.parameters())
     print(f"mode={cfg['mode']}  trainable encoder {n_enc / 1e6:.1f}M  head {n_head / 1e6:.1f}M")
