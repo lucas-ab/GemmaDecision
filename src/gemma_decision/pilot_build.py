@@ -29,7 +29,7 @@ LIC = {
     "banking77": "cc-by-4.0", "clinc": "cc-by-3.0", "massive": "cc-by-4.0", "mnli": "cc-by-sa-3.0 / oanc",
     "fleurs": "cc-by-4.0", "slurp": "cc-by-4.0", "minds14": "cc-by-4.0", "belebele_fleurs": "cc-by-sa-4.0",
     "cremad": "odbl-1.0", "textvqa": "cc-by-4.0 (images cc-by-2.0)", "gqa": "cc-by-4.0", "eurosat": "mit",
-    "oxford_pets": "cc-by-sa-4.0", "cord": "cc-by-4.0",
+    "oxford_pets": "cc-by-sa-4.0", "cord": "cc-by-4.0", "snake": "apache-2.0 (generated)",
 }
 
 # --------------------------------------------------------------------------- helpers
@@ -489,6 +489,32 @@ def build_cord(n, rng):
             "test": []}
 
 
+def build_snake(n, rng):
+    """Teacher-labelled Snake decisions (gemma_decision/snake.py). States come from games where the teacher
+    plays with 25% random moves, so risky positions appear too; the label is always the teacher's move.
+    Renderings: text = ASCII board, media = board image, both = both (never the `hints` mode)."""
+    from .snake import SnakeGame, teacher
+
+    out = {"train": [], "test": []}
+    for split, seed0 in (("train", 0), ("test", 900_000)):  # disjoint game seeds
+        seed = seed0
+        while len(out[split]) < n[split]:
+            game = SnakeGame(seed=seed)
+            play_rng = random.Random(f"snake-play-{seed}")
+            while game.alive and game.steps < 400 and len(out[split]) < n[split]:
+                label = teacher(game)
+                if rng.random() < 0.5:  # thin consecutive near-duplicate states
+                    grid, img = game.decision("grid"), game.decision("image")
+                    texts = {"text": grid["state"], "media": img["state"],
+                             "both": grid["state"] + "\nBoard image: <|image|>"}
+                    out[split].append(make_row(f"snake_{seed}_{game.steps}", "snake", grid["questions"],
+                                               {"move": label}, texts, ["text", "media", "both"],
+                                               images=img["images"]))
+                game.step(label if play_rng.random() >= 0.25 else play_rng.choice(game.legal_moves()))
+            seed += 1
+    return out
+
+
 # --------------------------------------------------------------------------- main
 
 PILOT = {  # source: (builder, train rows, test rows)
@@ -499,6 +525,7 @@ PILOT = {  # source: (builder, train rows, test rows)
     "textvqa": (build_textvqa, 1500, 200), "gqa": (build_gqa, 1200, 200), "eurosat": (build_eurosat, 500, 150),
     "oxford_pets": (build_pets, 500, 150), "cord": (build_cord, 800, 0),
 }
+EXTRA = {"snake": (build_snake, 6000, 600)}  # built on request (--sources snake), not part of the pilot mix
 SCHEMA = pa.schema([
     ("id", pa.string()), ("workflow", pa.string()), ("source", pa.string()), ("license", pa.string()),
     ("state_text", pa.string()), ("state_media", pa.string()), ("state_both", pa.string()),
@@ -509,14 +536,14 @@ SCHEMA = pa.schema([
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sources", nargs="+", default=list(PILOT))
+    ap.add_argument("--sources", nargs="+", default=list(PILOT), help=f"any of {list(PILOT) + list(EXTRA)}")
     ap.add_argument("--scale", type=float, default=1.0, help="multiply row counts (e.g. 0.01 for a smoke build)")
     ap.add_argument("--out", type=Path, default=Path("data/pilot"))
     ap.add_argument("--seed", type=int, default=3407)
     args = ap.parse_args()
 
     for src in args.sources:
-        builder, n_train, n_test = PILOT[src]
+        builder, n_train, n_test = {**PILOT, **EXTRA}[src]
         n = {"train": max(1, int(n_train * args.scale)), "test": int(n_test * args.scale) if n_test else 0}
         built = builder(n, random.Random(f"{args.seed}-{src}"))
         for split, rows in built.items():
