@@ -201,24 +201,31 @@ def _wav16k(audio_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def build_calls(split: str, n: int, rng: random.Random) -> list[dict]:
+MINDS_ENGLISH = ("en-US", "en-GB", "en-AU")
+MINDS_ALL = MINDS_ENGLISH + ("cs-CZ", "de-DE", "es-ES", "fr-FR", "it-IT", "ko-KR", "nl-NL", "pl-PL", "pt-PT", "ru-RU", "zh-CN")
+
+
+def build_calls(split: str, n: int, rng: random.Random, configs=MINDS_ENGLISH) -> list[dict]:
     from datasets import Audio, load_dataset
 
     names = None
     candidates = []
-    for cfg in ("en-US", "en-GB", "en-AU"):
+    for cfg in configs:
         ds = load_dataset("PolyAI/minds14", cfg, split="train").cast_column("audio", Audio(decode=False))
         names = ds.features["intent_class"].names
         for r in ds:
-            # MINDS-14 ships one split; hold out 40% by a stable hash of the file path as test.
-            in_test = stable_frac(r["path"]) < 0.4
+            # MINDS-14 ships one split; hold out 40% of the English files (stable hash of the path) as test.
+            # Non-English files are never in the test split.
+            in_test = cfg in MINDS_ENGLISH and stable_frac(r["path"]) < 0.4
             if (split == "test") == in_test:
-                candidates.append(r)
+                candidates.append((cfg, r))
     rng.shuffle(candidates)
     rows = []
-    for r in candidates[:n]:
+    for cfg, r in candidates[:n]:
         label = names[r["intent_class"]]
-        transcript = (r["english_transcription"] or r["transcription"]).strip()
+        # English: the cleaned English transcript (as in the published test split); others: their own language
+        transcript = ((r["english_transcription"] or r["transcription"]) if cfg in MINDS_ENGLISH
+                      else (r["transcription"] or r["english_transcription"])).strip()
         head = f"A customer called the bank's phone line. {PREFIX_NOTE}\n"
         texts = {
             "text": f"{head}Call transcript: {transcript}",

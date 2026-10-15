@@ -18,7 +18,11 @@ import yaml
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
-from .data import collate, encode, length_bucketed_batches, load_examples, split_holdout
+from .data import (
+    collate, collate_mm, encode, length_bucketed_batches, load_examples, load_pilot_examples, media_reserve,
+    pick_rendering, split_holdout,
+)
+from .mm_build import stable_frac
 from .evaluate import fit_temperatures, format_report, report, run
 from .losses import decision_loss
 from .model import MODEL_ID, ClefHead, DecisionModel, load_encoder, to_device
@@ -46,6 +50,10 @@ DEFAULTS = {
     "holdout": 0.1,
     "seed": 3407,
     "select_by": "kl",  # best epoch by val "kl" (lower) or "acc" (higher)
+    # Extra training data from gd-pilot-build (None = typed-decisions only). Example:
+    # mix: {pilot_dir: data/pilot, sources: null, typed_repeat: 3, holdout: 0.05,
+    #       weights: {media: 0.5, both: 0.3, text: 0.2}}
+    "mix": None,
     "loss": {"brier": 1.0, "ordinal": 0.5, "hard_weight": 0.0},
     "head": {"d": 512, "heads": 8, "n_cross": 2, "n_joint": 2, "dropout": 0.1},
     "lora": {"r": 16, "alpha": 32, "dropout": 0.05},
@@ -153,16 +161,36 @@ def main():
     train_ex, val_ex = split_holdout(load_examples(cfg["dataset"], cfg["dataset_config"], "train"), cfg["holdout"],
                                      cfg.get("split_seed", 3407))  # fixed across training seeds
     test_ex = load_examples(cfg["dataset"], cfg["dataset_config"], "test")
+    pilot_test, processor, weights = [], None, {}
+    if cfg.get("mix"):
+        from transformers import AutoProcessor
+
+        mix = cfg["mix"]
+        weights = mix.get("weights") or {"media": 0.5, "both": 0.3, "text": 0.2}
+        pilot = load_pilot_examples(mix["pilot_dir"], "train", mix.get("sources"))
+        pilot_val = [pick_rendering(ex, None, weights) for ex in pilot if stable_frac(ex.id) < mix.get("holdout", 0.05)]
+        pilot_train = [ex for ex in pilot if stable_frac(ex.id) >= mix.get("holdout", 0.05)]
+        pilot_test = [pick_rendering(ex, None, weights) for ex in load_pilot_examples(mix["pilot_dir"], "test", mix.get("sources"))]
+        train_ex = train_ex * mix.get("typed_repeat", 1) + pilot_train
+        val_ex = val_ex + pilot_val
+        processor = AutoProcessor.from_pretrained(cfg["model_id"])
     if args.limit:
+        rng.shuffle(train_ex)
         train_ex, val_ex, test_ex = train_ex[: args.limit], val_ex[: args.limit // 4], test_ex[: args.limit // 4]
-    print(f"train {len(train_ex)}  val {len(val_ex)}  test {len(test_ex)}  device {device}")
+        pilot_test = pilot_test[: args.limit // 4]
+    print(f"train {len(train_ex)}  val {len(val_ex)}  test {len(test_ex)}  pilot test {len(pilot_test)}  device {device}")
 
     model = build_model(cfg).to(device)
     n_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     n_head = sum(p.numel() for p in model.head.parameters())
     print(f"mode={cfg['mode']}  trainable encoder {n_enc / 1e6:.1f}M  head {n_head / 1e6:.1f}M")
 
-    lengths = [len(encode(tokenizer, ex.state, ex.questions, cfg["max_length"]).input_ids) for ex in train_ex]
+    def est_len(ex):
+        ex = pick_rendering(ex, None, weights)
+        return len(tokenizer(ex.state).input_ids) + sum(len(q.instructions) // 3 + 12 * len(q.keys) for q in ex.questions) \
+            + (media_reserve(ex) if "<|" in ex.state else 0)
+
+    lengths = [est_len(ex) for ex in train_ex]
     steps_per_epoch = math.ceil(len(train_ex) / cfg["batch_size"] / cfg["grad_accum"])
     total = cfg["max_steps"] or steps_per_epoch * cfg["epochs"]
     warmup = max(1, int(total * cfg["warmup_ratio"]))
@@ -177,14 +205,28 @@ def main():
     log = (run_dir / "log.jsonl").open("w")
     step, micro, t0 = 0, 0, time.time()
     best_score, best_state = float("-inf"), None
+    skipped: dict[str, int] = {}
     pbar = tqdm(total=total, desc=cfg["name"])
     epoch = 0
     while step < total:
         model.train()
         for idx in length_bucketed_batches(lengths, cfg["batch_size"], rng):
-            enc = [encode(tokenizer, train_ex[i].state, train_ex[i].questions, cfg["max_length"],
-                          rng if cfg["augment"] else None) for i in idx]
-            batch = collate(enc, tokenizer.pad_token_id)
+            exs, enc = [], []
+            for i in idx:
+                ex = pick_rendering(train_ex[i], rng, weights)
+                media = "<|image|>" in ex.state or "<|audio|>" in ex.state
+                try:
+                    enc.append(encode(tokenizer, ex.state, ex.questions, cfg["max_length"],
+                                      rng if cfg["augment"] else None, reserve=media_reserve(ex) if media else 0))
+                    exs.append(ex)
+                except ValueError as err:  # one oversized row must not end a long run
+                    skipped[ex.workflow] = skipped.get(ex.workflow, 0) + 1
+                    if sum(skipped.values()) <= 5:
+                        print(f"skipping {ex.id}: {err}", flush=True)
+            if not exs:
+                continue
+            has_media = any("<|image|>" in ex.state or "<|audio|>" in ex.state for ex in exs)
+            batch = collate_mm(enc, exs, processor) if has_media else collate(enc, tokenizer.pad_token_id)
             batch.pop("q_meta")
             batch = to_device(batch, device)
             with autocast(cfg, device):
@@ -209,9 +251,10 @@ def main():
                 break
         epoch += 1
         # Validate at each epoch end (and at the end of a max_steps run); keep the best by KL to gold.
-        val = report(run(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], calibrated=False)[0])["overall"]
+        val = report(run(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], calibrated=False,
+                         processor=processor)[0])["overall"]
         print(f"\nepoch {epoch} step {step}: val acc {val['acc']:.3f}  annot_agree {val['annot_agree']:.3f}  kl {val['kl']:.3f}  ece {val['ece']:.3f}", flush=True)
-        log.write(json.dumps({"step": step, "epoch": epoch, "val": val}) + "\n")
+        log.write(json.dumps({"step": step, "epoch": epoch, "val": val, "skipped": skipped}) + "\n")
         log.flush()
         score = -val["kl"] if cfg["select_by"] == "kl" else val["acc"]
         if score > best_score:
@@ -219,12 +262,13 @@ def main():
     pbar.close()
 
     model.load_state_dict(best_state, strict=False)
-    temps = fit_temperatures(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"])
+    temps = fit_temperatures(model, tokenizer, val_ex, device, cfg["batch_size"], cfg["max_length"], processor)
     print(f"temperatures (choice, noul, score): {[round(t, 3) for t in temps]}")
     save_file({k: v.contiguous() for k, v in model.trainable_state_dict().items()}, run_dir / "trainable.safetensors")
 
-    for split, exs in (("val", val_ex), ("test", test_ex)):
-        res = report(run(model, tokenizer, exs, device, cfg["batch_size"], cfg["max_length"])[0])
+    evals = [("val", val_ex), ("test", test_ex)] + ([("pilot_test", pilot_test)] if pilot_test else [])
+    for split, exs in evals:
+        res = report(run(model, tokenizer, exs, device, cfg["batch_size"], cfg["max_length"], processor=processor)[0])
         res["meta"] = {"train_minutes": round((time.time() - t0) / 60, 1), "steps": step, "temperatures": temps,
                        "trainable_encoder_params": n_enc, "head_params": n_head}
         (run_dir / f"eval_{split}.json").write_text(json.dumps(res, indent=2))

@@ -36,11 +36,21 @@ def run(
     records, all_logits = [], []
     for i in range(0, len(examples), batch_size):
         chunk = examples[i : i + batch_size]
-        has_media = any(ex.images or ex.audio for ex in chunk)
+        has_media = any("<|image|>" in ex.state or "<|audio|>" in ex.state for ex in chunk)
         if has_media and processor is None:
             raise ValueError("examples contain images/audio; pass processor=")
-        enc = [encode(tokenizer, ex.state, ex.questions, max_length, reserve=media_reserve(ex) if has_media else 0)
-               for ex in chunk]
+        enc, kept = [], []
+        for ex in chunk:
+            try:
+                enc.append(encode(tokenizer, ex.state, ex.questions, max_length,
+                                  reserve=media_reserve(ex) if has_media else 0))
+                kept.append(ex)
+            except ValueError as err:
+                print(f"eval: skipping {ex.id}: {err}", flush=True)
+        if not kept:
+            continue
+        chunk = kept
+        has_media = any("<|image|>" in ex.state or "<|audio|>" in ex.state for ex in chunk)
         batch = collate_mm(enc, chunk, processor) if has_media else collate(enc, tokenizer.pad_token_id)
         meta = batch.pop("q_meta")
         logits = model(to_device(batch, device), calibrated=calibrated).float().cpu()
@@ -117,9 +127,10 @@ def format_report(res: dict) -> str:
     return "\n".join(lines)
 
 
-def fit_temperatures(model, tokenizer, examples, device, batch_size: int = 8, max_length: int = 1024) -> list[float]:
+def fit_temperatures(model, tokenizer, examples, device, batch_size: int = 8, max_length: int = 1024,
+                     processor=None) -> list[float]:
     """Fit one temperature per question type on held-out data by minimizing soft cross-entropy."""
-    _, logits = run(model, tokenizer, examples, device, batch_size, max_length, calibrated=False)
+    _, logits = run(model, tokenizer, examples, device, batch_size, max_length, calibrated=False, processor=processor)
     temps = []
     for t in range(len(TYPES)):
         items = [(lg, tg) for ty, lg, tg in logits if ty == t]

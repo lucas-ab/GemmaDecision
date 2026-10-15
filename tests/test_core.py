@@ -105,3 +105,20 @@ def test_metrics_perfect_prediction():
     m = metrics(recs)
     assert m["acc"] == 1.0 and m["annot_agree"] == 1.0 and m["row_acc"] == 1.0
 
+
+def test_long_audio_is_chunked_into_placeholders():
+    from gemma_decision.data import MAX_AUDIO_S, chunk_long_audio
+
+    wav = np.zeros(int(16000 * (2 * MAX_AUDIO_S + 5)), np.float32)
+    state, audio = chunk_long_audio("Passage: <|audio|> end", [wav])
+    assert state.count("<|audio|>") == 3 and len(audio) == 3
+    assert sum(len(a) for a in audio) == len(wav)
+
+
+def test_truncation_keeps_media_placeholders(processor):
+    tok = processor.tokenizer
+    state = "intro " * 400 + "<|image|>" + " tail" * 400 + "<|audio|>"
+    e = encode(tok, state, parse_questions(QUESTIONS, GOLD), max_length=300)
+    assert len(e.input_ids) <= 300
+    assert "<|image|>" in e.text and "<|audio|>" in e.text
+

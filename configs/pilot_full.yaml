@@ -1,0 +1,14 @@
+# Full fine-tune on typed-decisions (x3) + the commercial-safe pilot mix (text, audio, image).
+# Build the data first: `uv run modal run modal_app.py::pilot` (on Modal) or `uv run gd-pilot-build` (local).
+name: pilot_full
+mode: full
+epochs: 5
+max_length: 3072          # Belebele passages up to ~90 s = 3 x 750 audio tokens
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4
+mix:
+  pilot_dir: data/pilot
+  sources: null           # all built sources
+  typed_repeat: 3
+  holdout: 0.05
+  weights: {media: 0.5, both: 0.3, text: 0.2}

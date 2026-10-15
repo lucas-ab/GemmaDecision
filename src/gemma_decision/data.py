@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 
 import torch
 
 PREFIX = "task: classification | query: "
+PLACEHOLDER_RE = r"(<\|image\|>|<\|audio\|>|<\|video\|>)"
 TYPES = {"choice": 0, "noul": 1, "score": 2}
 DEFAULT_NOUL = {"true": "Yes, the statement holds.", "false": "No, the statement does not hold."}
 
@@ -43,8 +45,9 @@ class Example:
     workflow: str
     state: str  # may contain <|image|> / <|audio|> placeholders, filled in order from images / audio
     questions: list[Question] = field(default_factory=list)
-    images: list = field(default_factory=list)  # PIL images
-    audio: list = field(default_factory=list)  # float32 arrays at 16 kHz
+    images: list = field(default_factory=list)  # PIL images, or encoded bytes (decoded at collate time)
+    audio: list = field(default_factory=list)  # float32 arrays at 16 kHz, or WAV bytes (decoded at collate time)
+    renderings: dict | None = None  # {"text"|"media"|"both": state} for mixed training; see pick_rendering
 
 
 def parse_questions(questions: dict, gold: dict | None = None, agreement: dict | None = None) -> list[Question]:
@@ -178,19 +181,23 @@ def encode(
             reordered.append(_reorder(q, perm))
         questions = reordered
 
-    # Truncate the end of the state (never the questions) until the prompt fits.
+    # Shorten the state (never the questions or media placeholders) until the prompt fits: cut the end of
+    # the longest text segment between placeholders.
     while True:
         text, char_spans = _render(state, questions)
         enc = tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
         overflow = len(enc["input_ids"]) - max_length
         if overflow <= 0:
             break
+        parts = re.split(PLACEHOLDER_RE, state)  # text, placeholder, text, placeholder, ...
+        texts = parts[0::2]
+        longest = max(range(len(texts)), key=lambda i: len(texts[i]))
         cut = max(overflow * 3, 16)  # ~3+ chars per token
-        if cut >= len(state):
-            raise ValueError("questions alone exceed max_length")
-        if "<|" in state[-cut - 8 :]:
-            raise ValueError("truncation would cut a media placeholder; raise max_length")
-        state = state[:-cut]
+        if cut >= len(texts[longest]):
+            raise ValueError("prompt does not fit max_length even without state text")
+        texts[longest] = texts[longest][:-cut]
+        parts[0::2] = texts
+        state = "".join(parts)
 
     offsets = enc["offset_mapping"]
     spans = [
@@ -287,13 +294,28 @@ def length_bucketed_batches(lengths: list[int], batch_size: int, rng: random.Ran
 # --------------------------------------------------------------------------- multimodal
 
 MM_KEYS = ("pixel_values", "image_position_ids", "input_features", "input_features_mask")
+MAX_AUDIO_S = 30.0  # the processor keeps at most 30 s (750 tokens) per audio item and drops the rest
 AUDIO_TOKENS_PER_S = 25
 IMAGE_TOKENS = 282  # 280 soft tokens + begin/end markers (upper bound; aspect ratio can lower it)
 
 
+def _audio_seconds(a) -> float:
+    if isinstance(a, (bytes, bytearray)):
+        import io
+
+        import soundfile as sf
+
+        info = sf.info(io.BytesIO(a))
+        return info.frames / info.samplerate
+    return len(a) / 16000
+
+
 def media_reserve(ex: Example) -> int:
-    audio_s = sum(len(a) / 16000 for a in ex.audio)
-    return IMAGE_TOKENS * len(ex.images) + int(AUDIO_TOKENS_PER_S * audio_s) + 2 * len(ex.audio) + 8
+    """Upper bound on the tokens the state's media placeholders expand into."""
+    n_img = ex.state.count("<|image|>")
+    audio_s = sum(min(_audio_seconds(a), MAX_AUDIO_S) for a in ex.audio) if "<|audio|>" in ex.state else 0.0
+    n_aud = ex.state.count("<|audio|>")
+    return IMAGE_TOKENS * n_img + int(AUDIO_TOKENS_PER_S * audio_s) + 2 * n_aud + 8
 
 
 def _expand_spans(tokenizer, tok_ids: list[int], proc_ids: list[int], spans):
@@ -336,9 +358,9 @@ def collate_mm(encoded: list[Encoded], examples: list[Example], processor) -> di
     tokenizer = processor.tokenizer
     remapped, media = [], {k: [] for k in MM_KEYS}
     for e, ex in zip(encoded, examples):
-        out = processor(
-            text=e.text, images=ex.images or None, audio=ex.audio or None, return_tensors="pt",
-        )
+        images = [decode_image(x) for x in ex.images] if "<|image|>" in e.text else []
+        audio = [decode_audio(x) for x in ex.audio] if "<|audio|>" in e.text else []
+        out = processor(text=e.text, images=images or None, audio=audio or None, return_tensors="pt")
         ids = out["input_ids"][0].tolist()
         remapped.append(Encoded(e.text, ids, _expand_spans(tokenizer, e.input_ids, ids, e.spans), e.questions))
         for k in MM_KEYS:
@@ -350,6 +372,80 @@ def collate_mm(encoded: list[Encoded], examples: list[Example], processor) -> di
         if ts:
             batch[k] = _pad_cat(ts, pad_values[k])
     return batch
+
+
+def decode_image(x):
+    if isinstance(x, (bytes, bytearray)):
+        import io
+
+        from PIL import Image
+
+        return Image.open(io.BytesIO(x)).convert("RGB")
+    return x
+
+
+def decode_audio(x):
+    if isinstance(x, (bytes, bytearray)):
+        import io
+
+        import numpy as np
+        import soundfile as sf
+
+        return sf.read(io.BytesIO(x), dtype="float32")[0].astype(np.float32)
+    return x
+
+
+def chunk_long_audio(state: str, audio: list) -> tuple[str, list]:
+    """Split audio over MAX_AUDIO_S into consecutive chunks, one <|audio|> placeholder each (in order)."""
+    if not audio or all(_audio_seconds(a) <= MAX_AUDIO_S for a in audio):
+        return state, audio
+    pieces, new_audio, k = re.split(r"(<\|audio\|>)", state), [], 0
+    for i, piece in enumerate(pieces):
+        if piece == "<|audio|>":
+            wav = decode_audio(audio[k])
+            k += 1
+            step = int(MAX_AUDIO_S * 16000)
+            chunks = [wav[j : j + step] for j in range(0, len(wav), step)] or [wav]
+            new_audio += chunks
+            pieces[i] = "<|audio|>" * len(chunks)
+    return "".join(pieces), new_audio
+
+
+def load_pilot_examples(root, split: str = "train", sources: list[str] | None = None) -> list[Example]:
+    """Rows from `gd-pilot-build` with every allowed rendering kept; media stays as bytes until collate."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    out = []
+    for path in sorted(Path(root, split).glob("*.parquet")):
+        if sources and path.stem not in sources:
+            continue
+        for row in pq.read_table(path).to_pylist():
+            renderings = {v: row[f"state_{v}"] for v in row["variants"]}
+            audio = row["audio"]
+            if audio and any(_audio_seconds(a) > MAX_AUDIO_S for a in audio):
+                for v, st in renderings.items():
+                    if "<|audio|>" in st:
+                        renderings[v], chunked = chunk_long_audio(st, audio)
+                audio = chunked
+            first = next(iter(renderings))
+            ex = row_to_example({**row, "state": renderings[first]})
+            ex.images, ex.audio, ex.renderings = row["images"], audio, renderings
+            out.append(ex)
+    return out
+
+
+def pick_rendering(ex: Example, rng: random.Random | None, weights: dict[str, float],
+                   prefer: tuple[str, ...] = ("media", "both", "text")) -> Example:
+    """Copy of `ex` with one rendering chosen: weighted-random with `rng`, else the first allowed in `prefer`."""
+    if not ex.renderings:
+        return ex
+    allowed = [v for v in prefer if v in ex.renderings]
+    if rng is not None:
+        allowed = rng.choices(allowed, weights=[weights.get(v, 0.0) + 1e-9 for v in allowed])
+    v = allowed[0]
+    return Example(ex.id, ex.workflow, ex.renderings[v], ex.questions, ex.images, ex.audio, ex.renderings)
 
 
 def load_mm_examples(root, split: str = "test", variant: str = "both", workflows: list[str] | None = None) -> list[Example]:
@@ -371,6 +467,26 @@ def load_mm_examples(root, split: str = "test", variant: str = "both", workflows
             if variant != "text":
                 ex.images = [Image.open(io.BytesIO(b)).convert("RGB") for b in row["images"]]
                 ex.audio = [sf.read(io.BytesIO(b), dtype="float32")[0].astype(np.float32) for b in row["audio"]]
+                ex.state, ex.audio = chunk_long_audio(ex.state, ex.audio)
             out.append(ex)
     return out
 
+
+def check_encodable(examples: list[Example], tokenizer, max_length: int) -> dict:
+    """Encode every rendering of every example; returns {workflow: {"ok": n, "failed": n, "max_tokens": n}}."""
+    from collections import defaultdict
+
+    stats = defaultdict(lambda: {"ok": 0, "failed": 0, "max_tokens": 0})
+    for ex in examples:
+        for v, st in (ex.renderings or {"state": ex.state}).items():
+            probe = Example(ex.id, ex.workflow, st, ex.questions, ex.images, ex.audio)
+            media = "<|image|>" in st or "<|audio|>" in st
+            try:
+                reserve = media_reserve(probe) if media else 0
+                n = len(encode(tokenizer, st, ex.questions, max_length, reserve=reserve).input_ids) + reserve
+                s = stats[ex.workflow]
+                s["ok"] += 1
+                s["max_tokens"] = max(s["max_tokens"], n)
+            except ValueError:
+                stats[ex.workflow]["failed"] += 1
+    return dict(stats)

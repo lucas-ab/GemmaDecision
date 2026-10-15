@@ -43,7 +43,7 @@ VOLUMES = {"/cache/hf": hf_cache, f"{WORK}/runs": runs_vol, f"{WORK}/data": data
 app = modal.App(APP_NAME, image=image)
 
 
-@app.function(gpu=GPU_DEFAULT, volumes=VOLUMES, timeout=8 * 3600)
+@app.function(gpu=GPU_DEFAULT, volumes=VOLUMES, timeout=8 * 3600, cpu=8, memory=32768)
 def train(config_yaml: str, name: str, overrides: list[str], max_steps: int | None = None,
           limit: int | None = None) -> dict:
     import os
@@ -144,6 +144,67 @@ def eval_runs(names: str, gpu: str = GPU_DEFAULT):
         for fname, content in files.items():
             (out / fname).write_text(content)
         print(f"[{n}] -> {out}: {sorted(files)}")
+
+
+@app.function(volumes=VOLUMES, cpu=4, memory=32768, timeout=4 * 3600)
+def build_source(source: str, scale: float = 1.0, out: str = "data/pilot") -> str:
+    """Build one gd-pilot-build source on a CPU container, straight onto the data volume."""
+    import os
+    import sys
+
+    os.chdir(WORK)
+    from gemma_decision import pilot_build
+
+    sys.argv = ["gd-pilot-build", "--sources", source, "--scale", str(scale), "--out", out]
+    try:
+        pilot_build.main()
+    finally:
+        hf_cache.commit()
+        data_vol.commit()
+    return source
+
+
+@app.function(volumes=VOLUMES, cpu=4, memory=32768, timeout=3600)
+def check_pilot(root: str = "data/pilot", max_length: int = 2048) -> dict:
+    """Encode every rendering of every pilot row (train + test) the way training will; report failures."""
+    import os
+
+    os.chdir(WORK)
+    from transformers import AutoTokenizer
+
+    from gemma_decision.data import check_encodable, load_pilot_examples
+
+    tok = AutoTokenizer.from_pretrained("google/embeddinggemma-2")
+    return {split: check_encodable(load_pilot_examples(root, split), tok, max_length) for split in ("train", "test")}
+
+
+@app.local_entrypoint()
+def preflight(root: str = "data/pilot", max_length: int = 2048):
+    res = check_pilot.remote(root, max_length)
+    for split, stats in res.items():
+        for wf, s in sorted(stats.items()):
+            flag = "  <-- FAILURES" if s["failed"] else ""
+            print(f"{split:5s} {wf:16s} ok {s['ok']:6d} failed {s['failed']:4d} max_tokens {s['max_tokens']:5d}{flag}")
+
+
+@app.local_entrypoint()
+def pilot(sources: str = "", scale: float = 1.0, out: str = "data/pilot"):
+    """Build the pilot mix on Modal, one CPU container per source in parallel (no GPU)."""
+    from gemma_decision.pilot_build import PILOT
+
+    names = [s.strip() for s in sources.split(",") if s.strip()] or list(PILOT)
+    calls = [(n, build_source.spawn(n, scale, out)) for n in names]
+    for n, call in calls:
+        try:
+            call.get()
+            print(f"built {n}")
+        except Exception as e:
+            print(f"[{n}] FAILED: {type(e).__name__}: {e}")
+    for split in ("train", "test"):
+        try:
+            print(split, sorted(e.path for e in data_vol.listdir(f"{out.removeprefix('data/')}/{split}")))
+        except Exception:
+            pass
 
 
 # $/hour = Modal's per-second list price x 3600 (modal.com/pricing, 2026-10-14). T4 is left out: no bf16.
