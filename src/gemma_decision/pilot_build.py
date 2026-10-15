@@ -23,6 +23,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .label_descriptions import (
+    ASSISTANT_INTENTS, ASSISTANT_SCENARIOS, BANKING77, CLINC, describe, slurp_canonical,
+)
 from .mm_build import MINDS_ALL, PREFIX_NOTE, _wav16k, build_calls, build_receipts, jpeg_bytes, stable_frac
 
 LIC = {
@@ -130,7 +133,8 @@ def build_banking77(n, rng):
         for i, r in enumerate(rows[: n[split]]):
             gold = r["label_text"]
             related = [l for l in labels if l != gold and set(l.split("_")) & set(gold.split("_"))]
-            q = {"intent": choice_q("What does the bank customer want?", shortlist(gold, labels, 10, rng, related))}
+            q = {"intent": choice_q("What does the bank customer want?", shortlist(gold, labels, 10, rng, related),
+                                    describe(BANKING77, "banking77"))}
             out[split].append(text_row(f"banking77_{split}_{i}", "banking77", "A message sent to a bank's support chat.",
                                        f"Message: {r['text']}", q, {"intent": gold}))
     return out
@@ -140,7 +144,7 @@ def build_clinc(n, rng):
     from huggingface_hub import hf_hub_download
 
     out = {"train": [], "test": []}
-    describe = lambda k: "Out of scope: none of the other requests" if k == "oos" else human(k)  # noqa: E731
+    clinc_desc = describe(CLINC, "clinc")
     for split in ("train", "test"):
         path = shards("clinc/clinc_oos", f"plus/{split}-*.parquet")[0]
         pf = pq.ParquetFile(hf_hub_download("clinc/clinc_oos", path, repo_type="dataset"))
@@ -153,7 +157,7 @@ def build_clinc(n, rng):
             # every question offers "out of scope" alongside 9 intents (the gold one when it is in scope)
             keys = shortlist(gold, in_scope, 10, rng) if gold == "oos" else shortlist(gold, in_scope, 9, rng) + ["oos"]
             rng.shuffle(keys)
-            q = {"intent": choice_q("Which request is the user making to the assistant?", keys, describe)}
+            q = {"intent": choice_q("Which request is the user making to the assistant?", keys, clinc_desc)}
             out[split].append(text_row(f"clinc_{split}_{i}", "clinc", "A request typed to a virtual assistant.",
                                        f"Request: {r['text']}", q, {"intent": gold}))
     return out
@@ -181,8 +185,10 @@ def build_massive(n, rng):
                 scen = gold.split("_")[0]
                 related = [x for x in intents if x.startswith(scen + "_") and x != gold]
                 q = {
-                    "scenario": choice_q("Which area does the request belong to?", scenarios),
-                    "intent": choice_q("Which action is requested?", shortlist(gold, intents, 10, rng, related)),
+                    "scenario": choice_q("Which area does the request belong to?", scenarios,
+                                         describe(ASSISTANT_SCENARIOS, "massive")),
+                    "intent": choice_q("Which action is requested?", shortlist(gold, intents, 10, rng, related),
+                                       describe(ASSISTANT_INTENTS, "massive")),
                 }
                 out[split].append(text_row(f"massive_{lang}_{split}_{i}", "massive",
                                            "A request spoken to a home voice assistant (transcribed).",
@@ -257,7 +263,8 @@ def build_fleurs(n, rng):
 def _intent_question(gold, intents, rng):
     scen = gold.split("_")[0]
     related = [x for x in intents if x.startswith(scen + "_") and x != gold]
-    return choice_q("Which action is requested?", shortlist(gold, intents, 10, rng, related))
+    return choice_q("Which action is requested?", shortlist(gold, intents, 10, rng, related),
+                    describe(ASSISTANT_INTENTS, "slurp"))
 
 
 def build_slurp(n, rng):
@@ -270,15 +277,16 @@ def build_slurp(n, rng):
         names = json.loads(pf.schema_arrow.metadata[b"huggingface"])["info"]["features"]["intent"]["names"]
         rows = read_rows("qmeeus/slurp", path, n[split] * 4)
         seen, picked = set(), []
-        for r in rows:  # several recordings per sentence: keep one
-            if r["sentence"] not in seen and "_" in names[r["intent"]]:
+        for r in rows:  # several recordings per sentence: keep one; drop ambiguous legacy labels
+            if r["sentence"] not in seen and slurp_canonical(names[r["intent"]]):
                 seen.add(r["sentence"])
                 picked.append(r)
-        intents = sorted({x for x in names if "_" in x})
-        scenarios = sorted({x.split("_")[0] for x in intents})
+        intents = sorted(ASSISTANT_INTENTS)  # the canonical 60 (same as MASSIVE)
+        scenarios = sorted(ASSISTANT_SCENARIOS)  # the official 18
         for i, r in enumerate(picked[: n[split]]):
-            gold = names[r["intent"]]
-            questions = {"scenario": choice_q("Which area does the request belong to?", scenarios),
+            gold = slurp_canonical(names[r["intent"]])
+            questions = {"scenario": choice_q("Which area does the request belong to?", scenarios,
+                                              describe(ASSISTANT_SCENARIOS, "slurp")),
                          "intent": _intent_question(gold, intents, rng)}
             head = f"A request spoken to a home voice assistant. {PREFIX_NOTE}\n"
             texts = {"text": f"{head}Transcript: {r['sentence']}", "media": f"{head}Recording: <|audio|>",

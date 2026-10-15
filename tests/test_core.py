@@ -122,3 +122,12 @@ def test_truncation_keeps_media_placeholders(processor):
     assert len(e.input_ids) <= 300
     assert "<|image|>" in e.text and "<|audio|>" in e.text
 
+
+def test_label_descriptions_cover_canonical_inventories():
+    from gemma_decision.label_descriptions import ASSISTANT_INTENTS, ASSISTANT_SCENARIOS, SLURP_LEGACY, slurp_canonical
+
+    assert len(ASSISTANT_SCENARIOS) == 18 and len(ASSISTANT_INTENTS) == 60
+    assert {i.split("_")[0] for i in ASSISTANT_INTENTS} == set(ASSISTANT_SCENARIOS)
+    assert all(v in ASSISTANT_INTENTS for v in SLURP_LEGACY.values())
+    assert slurp_canonical("hue_lightoff") == "iot_hue_lightoff"
+    assert slurp_canonical("query") is None and slurp_canonical("music") is None
