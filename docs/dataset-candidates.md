@@ -135,3 +135,28 @@ AG News) should be a separate config if anything is published.
 | eurosat | image | MIT | 500 / 150 | land use (10) |
 | oxford_pets | image | CC BY-SA 4.0 | 500 / 150 | dog? (noul) + breed shortlist |
 | cord | image (+ OCR) | CC BY 4.0 | 800 / 0 (test = `data/mm-decisions`) | payment, total, item count, discount |
+
+## GitHub search (2026-10-15): decision-model data and synthetic recipes
+
+The decision-model community publishes data and generators on GitHub; the curated index is
+[awesome-decision-models](https://github.com/AnotiaWang/awesome-decision-models) (CC0).
+
+| source | what | licence | used? |
+|---|---|---|---|
+| [Valen-Training-General-100k](https://huggingface.co/datasets/Valen-Team/Valen-Training-General-100k) ([GitHub](https://github.com/Liuziyu77/Valen)) | 100k image decisions (VQA, UI, games, documents), one question each, per-row upstream licence | Apache-2.0 card | **Yes**: 6,000 train / 600 test from the commercial-safe sources only (RICO ScreenQA CC BY 4.0, GameQA MIT, GQA, TextVQA, CLEVR CC BY 4.0, Valen's programmatic rows); dropped VQAv2 (COCO Flickr licences), ChartQA (GPL-3.0), DocVQA and ShowUI (upstream terms). `gd-pilot-build --sources valen` |
+| [jaredpalmer/kev](https://github.com/jaredpalmer/kev) | `decision-v7`: 10k public-dataset rows + 896 generated policy + 1,680 rule-structure rows; no teacher outputs | Apache-2.0 code | next: rule/policy generators |
+| [strands-labs/strands-decider](https://github.com/strands-labs/strands-decider) | 246k-row mix, licence audit per source ([data/sources.md](https://github.com/strands-labs/strands-decider/blob/main/data/sources.md)); committed Qwen-written, Qwen-verified synthetic files; catch-all and instruction-flip recipes | Apache-2.0 | recipes adapted (below) |
+| [Valen-Eval-Game](https://huggingface.co/datasets/Valen-Team/Valen-Eval-Game) | 30k Sokoban decision levels | Apache-2.0 | candidate (planning from images) |
+| Microsoft GUIDE (via [security-alert-triage](https://github.com/vishnukanchi9/security-alert-triage)) | 1.03M graded security incidents | to check | candidate for security workflow |
+| [Inv3D generator](https://github.com/FelixHertlein/inv3d-generator) | invoice document image generator | MIT | candidate for invoice images |
+
+### Synthetic rows built by code (`gd-synth-build`, no teacher model)
+
+Sources: typed-decisions train rows outside gd-train's validation holdout, and gd-pilot-build train rows
+outside the mix holdout; test rows are never read.
+
+| recipe | what changes | gold | rows (typed / pilot) |
+|---|---|---|---|
+| catch_all | a choice question gets "None of the other options applies"; half the time the top option is removed | removed option's probability moves to "none" | 324 / 4,844 |
+| flip | a yes/no question is asked in reverse ("Reverse the answer: ...") | true and false swap (targets and descriptions) | 345 / 1,405 |
+| missing | evidence removed (no state, no media) | the question's prior from the source data | 54 / 810 |
