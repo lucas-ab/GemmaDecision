@@ -146,7 +146,7 @@ def eval_runs(names: str, gpu: str = GPU_DEFAULT):
         print(f"[{n}] -> {out}: {sorted(files)}")
 
 
-@app.function(volumes=VOLUMES, cpu=4, memory=32768, timeout=4 * 3600)
+@app.function(volumes=VOLUMES, cpu=4, memory=65536, timeout=4 * 3600)
 def build_source(source: str, scale: float = 1.0, out: str = "data/pilot") -> str:
     """Build one gd-pilot-build source on a CPU container, straight onto the data volume."""
     import os

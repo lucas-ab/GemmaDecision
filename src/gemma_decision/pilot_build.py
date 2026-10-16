@@ -33,6 +33,7 @@ LIC = {
     "fleurs": "cc-by-4.0", "slurp": "cc-by-4.0", "minds14": "cc-by-4.0", "belebele_fleurs": "cc-by-sa-4.0",
     "cremad": "odbl-1.0", "textvqa": "cc-by-4.0 (images cc-by-2.0)", "gqa": "cc-by-4.0", "eurosat": "mit",
     "oxford_pets": "cc-by-sa-4.0", "cord": "cc-by-4.0", "snake": "apache-2.0 (generated)",
+    "valen": "per row (upstream licence)",
 }
 
 # --------------------------------------------------------------------------- helpers
@@ -80,8 +81,9 @@ def choice_q(instructions: str, keys: list[str], describe=human) -> dict:
     return {"type": "choice", "instructions": instructions, "criteria": {k: describe(k) for k in keys}}
 
 
-def make_row(rid, source, questions: dict, labels: dict, texts: dict, variants: list[str], images=(), audio=()):
-    """labels[name]: gold key (one-hot) or {key: probability} (soft)."""
+def make_row(rid, source, questions: dict, labels: dict, texts: dict, variants: list[str], images=(), audio=(),
+             license_: str | None = None):
+    """labels[name]: gold key (one-hot) or {key: probability} (soft). `license_` overrides the source's license."""
     gold, agreement = {}, {}
     for name, q in questions.items():
         if q["type"] == "score":
@@ -104,7 +106,7 @@ def make_row(rid, source, questions: dict, labels: dict, texts: dict, variants: 
         agreement[name] = {"argmax_agree": probs[top] >= 0.5, "argmax_majority": top,
                            "total_variation": 1 - probs[top]}
     return {
-        "id": rid, "workflow": source, "source": source, "license": LIC[source],
+        "id": rid, "workflow": source, "source": source, "license": license_ or LIC[source],
         "state_text": texts.get("text", ""), "state_media": texts.get("media", ""), "state_both": texts.get("both", ""),
         "variants": variants, "images": list(images), "audio": list(audio),
         "questions": json.dumps(questions), "gold": json.dumps(gold),
@@ -523,6 +525,56 @@ def build_snake(n, rng):
     return out
 
 
+VALEN_REPO = "Valen-Team/Valen-Training-General-100k"
+# Commercial-safe upstream sources only (see docs/dataset-candidates.md); dropped: vqav2 (COCO per-image
+# Flickr licences), chartqa (GPL-3.0), docvqa (DocVQA terms), showui_desktop (OmniAct terms).
+VALEN_SOURCES = {
+    "rico_screenqa": "A screenshot of a mobile app screen.",
+    "gameqa": "A picture of a game board or puzzle.",
+    "gqa": "A photo of an everyday scene.",
+    "textvqa": "A photo with some text in it.",
+    "clevr": "A rendered scene of simple 3D objects.",
+    "programmatic": "A rendered chart or table.",
+}
+
+
+def build_valen(n, rng):
+    """Image decisions from Valen-Training-General-100k (Apache-2.0 card; each row keeps its upstream licence).
+
+    Balanced across the commercial-safe sources; the test split is held out by image group (no shared images).
+    """
+    import zipfile
+
+    from huggingface_hub import hf_hub_download
+
+    rows = [json.loads(line) for line in open(hf_hub_download(VALEN_REPO, "train.jsonl", repo_type="dataset"))]
+    by_src = defaultdict(list)
+    for r in rows:
+        if r["meta"]["source"] in VALEN_SOURCES:
+            by_src[r["meta"]["source"]].append(r)
+    zf = zipfile.ZipFile(hf_hub_download(VALEN_REPO, "assets.zip", repo_type="dataset"))
+    out = {"train": [], "test": []}
+    for src in sorted(by_src):
+        items = by_src[src]
+        rng.shuffle(items)
+        for split in ("train", "test"):
+            want = n[split] // len(VALEN_SOURCES)
+            picked = [r for r in items if split_of(r["group_id"], 0.1) == split][:want]
+            for r in picked:
+                (qname, q), = r["request"]["questions"].items()
+                (_, target), = r["targets"].items()
+                img_paths = [c["image_url"]["url"] for m in r["request"]["state"]["messages"]
+                             for c in m["content"] if c["type"] == "image_url"]
+                images = [_img(zf.read(path)) for path in img_paths]
+                head = f"{VALEN_SOURCES[src]} Answer using only the visible image and the stated question. {PREFIX_NOTE}\n"
+                state = head + "\n".join("Image: <|image|>" for _ in images)
+                out[split].append(make_row(
+                    f"valen_{r['meta']['record_id']}", "valen", {"answer": q}, {"answer": target["probabilities"]},
+                    {"media": state}, ["media"], images=images, license_=r["meta"]["license"],
+                ))
+    return out
+
+
 # --------------------------------------------------------------------------- main
 
 PILOT = {  # source: (builder, train rows, test rows)
@@ -533,7 +585,7 @@ PILOT = {  # source: (builder, train rows, test rows)
     "textvqa": (build_textvqa, 1500, 200), "gqa": (build_gqa, 1200, 200), "eurosat": (build_eurosat, 500, 150),
     "oxford_pets": (build_pets, 500, 150), "cord": (build_cord, 800, 0),
 }
-EXTRA = {"snake": (build_snake, 6000, 600)}  # built on request (--sources snake), not part of the pilot mix
+EXTRA = {"snake": (build_snake, 6000, 600), "valen": (build_valen, 6000, 600)}  # built on request (--sources ...), not in the default mix
 SCHEMA = pa.schema([
     ("id", pa.string()), ("workflow", pa.string()), ("source", pa.string()), ("license", pa.string()),
     ("state_text", pa.string()), ("state_media", pa.string()), ("state_both", pa.string()),
