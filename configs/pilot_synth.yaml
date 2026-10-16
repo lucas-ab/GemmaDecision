@@ -1,0 +1,18 @@
+# pilot_full plus synthetic rows built by code from existing data (gd-synth-build: catch-all options,
+# flipped yes/no instructions, missing evidence) and a commercial-safe Valen-100k image slice.
+# Data: `modal run modal_app.py::pilot --sources valen` then `modal run modal_app.py::synth`.
+name: pilot_synth
+mode: full
+epochs: 5
+max_length: 3072
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4
+select_by: typed_kl
+mix:
+  pilot_dir: [data/pilot, data/synth]
+  sources: [banking77, clinc, massive, mnli, fleurs, slurp, minds14, belebele_fleurs, cremad,
+            textvqa, gqa, eurosat, oxford_pets, cord, valen,
+            catch_all_typed, flip_typed, missing_typed, catch_all_pilot, flip_pilot, missing_pilot]
+  typed_repeat: 3
+  holdout: 0.05
+  weights: {media: 0.5, both: 0.3, text: 0.2}

@@ -51,7 +51,8 @@ DEFAULTS = {
     "seed": 3407,
     "select_by": "kl",  # best epoch by val "kl" (lower), "acc" (higher), or "typed_kl" (KL on typed-decisions val rows only)
     # Extra training data from gd-pilot-build (None = typed-decisions only). Example:
-    # mix: {pilot_dir: data/pilot, sources: null, typed_repeat: 3, holdout: 0.05,
+    # mix: {pilot_dir: data/pilot (or a list of dirs), sources: null, typed_repeat: 3, holdout: 0.05,
+    #       source_caps: {banking77: 300},  # optional: fixed random subset per workflow (replay)
     #       weights: {media: 0.5, both: 0.3, text: 0.2}}
     "mix": None,
     "init_from": None,  # a run dir (or .safetensors) whose trained weights start this run
@@ -169,10 +170,24 @@ def main():
 
         mix = cfg["mix"]
         weights = mix.get("weights") or {"media": 0.5, "both": 0.3, "text": 0.2}
-        pilot = load_pilot_examples(mix["pilot_dir"], "train", mix.get("sources"))
+        dirs = mix["pilot_dir"] if isinstance(mix["pilot_dir"], list) else [mix["pilot_dir"]]
+        pilot = [ex for d in dirs for ex in load_pilot_examples(d, "train", mix.get("sources"))]
+        if mix.get("source_caps"):  # e.g. {banking77: 300}: keep a fixed random subset of those sources
+            cap_rng = random.Random(f"caps-{cfg.get('split_seed', 3407)}")
+            by_src: dict[str, list] = {}
+            synthetic = [ex for ex in pilot if "~" in ex.id]  # gd-synth-build rows are never capped
+            for ex in pilot:
+                if "~" not in ex.id:
+                    by_src.setdefault(ex.workflow, []).append(ex)
+            pilot = synthetic
+            for wf, exs in by_src.items():
+                cap = mix["source_caps"].get(wf)
+                if cap is not None and len(exs) > cap:
+                    exs = cap_rng.sample(exs, cap)
+                pilot += exs
         pilot_val = [pick_rendering(ex, None, weights) for ex in pilot if stable_frac(ex.id) < mix.get("holdout", 0.05)]
         pilot_train = [ex for ex in pilot if stable_frac(ex.id) >= mix.get("holdout", 0.05)]
-        pilot_test = [pick_rendering(ex, None, weights) for ex in load_pilot_examples(mix["pilot_dir"], "test", mix.get("sources"))]
+        pilot_test = [pick_rendering(ex, None, weights) for d in dirs for ex in load_pilot_examples(d, "test", mix.get("sources"))]
         train_ex = train_ex * mix.get("typed_repeat", 1) + pilot_train
         val_ex = val_ex + pilot_val
         processor = AutoProcessor.from_pretrained(cfg["model_id"])
