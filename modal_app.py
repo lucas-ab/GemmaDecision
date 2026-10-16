@@ -200,11 +200,12 @@ def check_pilot(root: str = "data/pilot", max_length: int = 2048) -> dict:
     from gemma_decision.data import check_encodable, load_pilot_examples
 
     tok = AutoTokenizer.from_pretrained("google/embeddinggemma-2")
-    return {split: check_encodable(load_pilot_examples(root, split), tok, max_length) for split in ("train", "test")}
+    return {split: check_encodable(load_pilot_examples(root, split), tok, max_length) for split in ("train", "test")
+            if (Path(root) / split).exists()}
 
 
 @app.local_entrypoint()
-def preflight(root: str = "data/pilot", max_length: int = 2048):
+def preflight(root: str = "data/pilot", max_length: int = 3072):
     res = check_pilot.remote(root, max_length)
     for split, stats in res.items():
         for wf, s in sorted(stats.items()):
