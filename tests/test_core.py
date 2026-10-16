@@ -131,3 +131,61 @@ def test_label_descriptions_cover_canonical_inventories():
     assert all(v in ASSISTANT_INTENTS for v in SLURP_LEGACY.values())
     assert slurp_canonical("hue_lightoff") == "iot_hue_lightoff"
     assert slurp_canonical("query") is None and slurp_canonical("music") is None
+
+
+def _synth_row(questions, gold, source="banking77"):
+    import json as _json
+
+    return {"id": "r1", "workflow": source, "source": source, "license": "x", "state_text": "Head. Evidence for the decision follows.\nMessage: hi",
+            "state_media": "", "state_both": "", "variants": ["text"], "images": [], "audio": [],
+            "questions": _json.dumps(questions), "gold": _json.dumps(gold), "label_agreement": "{}", "n_questions": len(questions)}
+
+
+def test_synth_catch_all_moves_removed_mass_to_none():
+    import json as _json
+
+    from gemma_decision.synth_build import NONE_KEY, catch_all
+
+    q = {"route": QUESTIONS["route"]}
+    g = {"route": {**GOLD["route"]}}
+    seen = set()
+    for seed in range(20):
+        out = catch_all(_synth_row(q, g), random.Random(seed))
+        qq, gg = _json.loads(out["questions"])["route"], _json.loads(out["gold"])["route"]
+        probs = gg["probabilities"]
+        assert set(probs) == set(qq["criteria"]) and NONE_KEY in probs
+        assert abs(sum(probs.values()) - 1) < 1e-9
+        if "billing" not in qq["criteria"]:  # removed: its 0.7 moved to none_of_these
+            assert probs[NONE_KEY] == pytest.approx(0.7) and gg["label"] == NONE_KEY
+            seen.add("removed")
+        else:
+            assert probs[NONE_KEY] == 0.0 and gg["label"] == "billing"
+            seen.add("kept")
+    assert seen == {"removed", "kept"}
+
+
+def test_synth_flip_swaps_targets_and_descriptions():
+    import json as _json
+
+    from gemma_decision.synth_build import FLIP_PREFIX, flip
+
+    q = {"urgent": {"type": "noul", "instructions": "Reply today.", "criteria": {"true": "Urgent", "false": "Can wait"}}}
+    g = {"urgent": {**GOLD["urgent"]}}
+    out = flip(_synth_row(q, g), random.Random(0))
+    qq, gg = _json.loads(out["questions"])["urgent"], _json.loads(out["gold"])["urgent"]
+    assert qq["instructions"].startswith(FLIP_PREFIX) and qq["criteria"] == {"true": "Can wait", "false": "Urgent"}
+    assert gg["probabilities"] == {"true": 0.4, "false": 0.6} and gg["label"] == "false"
+
+
+def test_synth_missing_uses_prior_and_drops_evidence():
+    import json as _json
+
+    from gemma_decision.synth_build import EMPTY_STATE, missing, priors
+
+    q = {"route": QUESTIONS["route"]}
+    rows = [_synth_row(q, {"route": {"probabilities": {"billing": 1.0, "shipping": 0.0, "access": 0.0}}}),
+            _synth_row(q, {"route": {"probabilities": {"billing": 0.0, "shipping": 1.0, "access": 0.0}}})]
+    out = missing(rows[0], priors(rows))
+    probs = _json.loads(out["gold"])["route"]["probabilities"]
+    assert probs["billing"] == pytest.approx(probs["shipping"]) and probs["access"] < 0.01
+    assert EMPTY_STATE in out["state_text"] and "Evidence" not in out["state_text"] and "hi" not in out["state_text"]

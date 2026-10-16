@@ -164,6 +164,31 @@ def build_source(source: str, scale: float = 1.0, out: str = "data/pilot") -> st
     return source
 
 
+@app.function(volumes=VOLUMES, cpu=4, memory=65536, timeout=4 * 3600)
+def build_synth(args: list[str]) -> str:
+    """gd-synth-build on a CPU container, reading data/pilot and writing data/synth on the data volume."""
+    import os
+    import sys
+
+    os.chdir(WORK)
+    from gemma_decision import synth_build
+
+    sys.argv = ["gd-synth-build", *args]
+    try:
+        synth_build.main()
+    finally:
+        hf_cache.commit()
+        data_vol.commit()
+    return "ok"
+
+
+@app.local_entrypoint()
+def synth(args: str = ""):
+    """Build data/synth from data/pilot (+ typed-decisions train) on Modal."""
+    print(build_synth.remote(args.split()))
+    print(sorted(e.path for e in data_vol.listdir("synth/train")))
+
+
 @app.function(volumes=VOLUMES, cpu=4, memory=32768, timeout=3600)
 def check_pilot(root: str = "data/pilot", max_length: int = 2048) -> dict:
     """Encode every rendering of every pilot row (train + test) the way training will; report failures."""
