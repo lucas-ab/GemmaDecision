@@ -1,0 +1,25 @@
+# Continue the best control model (pilot_full r2, seed 3407: best typed-decisions val KL) on the data it has
+# not seen: the commercial-safe Valen image slice and the gd-synth-build rows (catch-all, flipped yes/no,
+# missing evidence), with a capped replay of the original pilot sources and typed-decisions x1 so it does
+# not forget. Runs on the M1 Max (batch 4 x 2, gradient checkpointing). Lower learning rates than a fresh run.
+name: continue_synth
+mode: full
+init_from: runs/modal/pilot_full-r2-s3407
+epochs: 2
+max_length: 3072
+lr_encoder: 1.0e-5
+lr_head: 5.0e-5
+select_by: typed_kl
+max_batch_tokens: 6000    # worst case ~7 GB on MPS; 4 x 2,600-token rows hit the 18.7 GB cap
+save_every_steps: 300
+mix:
+  pilot_dir: [data/pilot, data/synth]
+  sources: [banking77, clinc, massive, mnli, fleurs, slurp, minds14, belebele_fleurs, cremad,
+            textvqa, gqa, eurosat, oxford_pets, cord, valen,
+            catch_all_typed, flip_typed, missing_typed, catch_all_pilot, flip_pilot, missing_pilot]
+  source_caps: {banking77: 300, clinc: 300, massive: 300, mnli: 300, fleurs: 300, slurp: 300, minds14: 300,
+                belebele_fleurs: 300, cremad: 300, textvqa: 300, gqa: 300, eurosat: 300, oxford_pets: 300,
+                cord: 300}
+  typed_repeat: 1
+  holdout: 0.05
+  weights: {media: 0.5, both: 0.3, text: 0.2}

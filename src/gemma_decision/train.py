@@ -38,6 +38,8 @@ DEFAULTS = {
     "grad_accum": 2,
     "gradient_checkpointing": True,
     "mps_memory_fraction": 0.75,  # fail fast with OOM instead of swapping the machine
+    "max_batch_tokens": None,  # split a length-bucketed batch when its estimated tokens exceed this (media runs)
+    "save_every_steps": None,  # also write latest.safetensors every N optimizer steps (crash insurance)
     "amp": "auto",  # "auto" = bf16 autocast on CUDA, fp32 elsewhere; "bf16" | "fp32" to force (never fp16)
     "epochs": 3,
     "max_steps": None,
@@ -231,9 +233,27 @@ def main():
     skipped: dict[str, int] = {}
     pbar = tqdm(total=total, desc=cfg["name"])
     epoch = 0
+    def token_capped(batches):
+        """Split batches whose estimated token total exceeds max_batch_tokens (long media rows go in smaller groups)."""
+        cap = cfg.get("max_batch_tokens")
+        for b in batches:
+            if not cap:
+                yield b
+                continue
+            cur, used = [], 0
+            for i in b:
+                if cur and used + lengths[i] > cap:
+                    yield cur
+                    cur, used = [], 0
+                cur.append(i)
+                used += lengths[i]
+            if cur:
+                yield cur
+
+    oom_skips = 0
     while step < total:
         model.train()
-        for idx in length_bucketed_batches(lengths, cfg["batch_size"], rng):
+        for idx in token_capped(length_bucketed_batches(lengths, cfg["batch_size"], rng)):
             exs, enc = [], []
             for i in idx:
                 ex = pick_rendering(train_ex[i], rng, weights)
@@ -252,10 +272,25 @@ def main():
             batch = collate_mm(enc, exs, processor) if has_media else collate(enc, tokenizer.pad_token_id)
             batch.pop("q_meta")
             batch = to_device(batch, device)
-            with autocast(cfg, device):
-                logits = model(batch, calibrated=False)
-            loss, parts = decision_loss(logits.float(), batch, **cfg["loss"])
-            (loss / cfg["grad_accum"]).backward()
+            try:
+                with autocast(cfg, device):
+                    logits = model(batch, calibrated=False)
+                loss, parts = decision_loss(logits.float(), batch, **cfg["loss"])
+                (loss / cfg["grad_accum"]).backward()
+            except RuntimeError as err:  # out of memory on one batch: drop it (and the partial accumulation), go on
+                if "out of memory" not in str(err):
+                    raise
+                oom_skips += 1
+                print(f"\nOOM on a batch of {len(exs)} rows (est. {sum(lengths[i] for i in idx)} tokens); skipped "
+                      f"({oom_skips} so far)", flush=True)
+                del batch
+                opt.zero_grad(set_to_none=True)
+                micro = 0
+                if device.type == "mps":
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
             micro += 1
             if micro % cfg["grad_accum"]:
                 continue
@@ -266,8 +301,12 @@ def main():
             step += 1
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.3f}")
+            if device.type == "mps" and step % 50 == 0:
+                torch.mps.empty_cache()  # long mixed-shape runs fragment the MPS heap
+            if cfg.get("save_every_steps") and step % cfg["save_every_steps"] == 0:
+                save_file({k: v.contiguous() for k, v in model.trainable_state_dict().items()}, run_dir / "latest.safetensors")
             if step % 10 == 0:
-                log.write(json.dumps({"step": step, "epoch": epoch, "loss": loss.item(), **parts,
+                log.write(json.dumps({"step": step, "epoch": epoch, "loss": loss.item(), **parts, "oom_skips": oom_skips,
                                       "elapsed_s": round(time.time() - t0, 2)}) + "\n")
                 log.flush()
             if step >= total:
@@ -286,6 +325,10 @@ def main():
         score = {"kl": -val["kl"], "typed_kl": -val["typed_kl"], "acc": val["acc"]}[cfg["select_by"]]
         if score > best_score:
             best_score, best_state = score, model.trainable_state_dict()
+            # persisted now, not only at the end: a stopped run still leaves its best weights (uncalibrated)
+            save_file({k: v.contiguous() for k, v in best_state.items()}, run_dir / "best_partial.safetensors")
+            (run_dir / "best_partial.json").write_text(json.dumps({"epoch": epoch, "step": step, "select_by": cfg["select_by"],
+                                                                   "score": score, "val": val}, indent=2))
     pbar.close()
 
     model.load_state_dict(best_state, strict=False)
