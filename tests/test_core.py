@@ -189,3 +189,42 @@ def test_synth_missing_uses_prior_and_drops_evidence():
     probs = _json.loads(out["gold"])["route"]["probabilities"]
     assert probs["billing"] == pytest.approx(probs["shipping"]) and probs["access"] < 0.01
     assert EMPTY_STATE in out["state_text"] and "Evidence" not in out["state_text"] and "hi" not in out["state_text"]
+
+
+def _s1_row(decisions, targets, state=None):
+    import json as _json
+
+    return {"case_id": "c1", "group_id": "g1", "input_hash": "h1", "split": "train", "language": "en",
+            "input": {"state_json": _json.dumps(state or {"text": "hello"}), "decisions": decisions},
+            "targets": targets}
+
+
+def _s1_decision(did, typ, crit, instructions="Decide."):
+    import json as _json
+
+    return {"id": did, "kind": "judgment", "type": typ, "instructions_json": _json.dumps(instructions),
+            "system_prompt": "", "documents": [], "scoring": None,
+            "criteria": [{"id": i, "description_json": _json.dumps(d), "value": v} for i, d, v in crit]}
+
+
+def test_s1mb_render_anonymizes_choice_and_orders_score():
+    from gemma_decision.s1mb_format import case_from_row, render
+
+    row = _s1_row(
+        [_s1_decision("intent", "choice", [("refund", "Refund", None), ("card", "Card issue", None)]),
+         _s1_decision("quality", "score", [("hi", "Good", 2.0), ("lo", "Bad", 0.0), ("mid", "Okay", 1.0)]),
+         _s1_decision("urgent", "noul", [("false", "Can wait", None), ("true", "Urgent", None)])],
+        [{"decision_id": "intent", "ids": ["refund", "card"], "probabilities": [0.0, 1.0]},
+         {"decision_id": "quality", "ids": ["hi", "lo", "mid"], "probabilities": [0.0, 0.25, 0.75]},
+         {"decision_id": "urgent", "ids": ["false", "true"], "probabilities": [0.3, 0.7]}])
+    case = case_from_row(row)
+    assert case["state"] == '{"text": "hello"}'
+    questions, labels, ids = render(case)
+    assert list(questions) == ["decision_1", "decision_2", "decision_3"]  # no source question IDs in the text
+    assert questions["decision_1"]["criteria"] == {"A": "Refund", "B": "Card issue"}
+    assert labels["decision_1"] == {"A": 0.0, "B": 1.0} and ids[0] == ["refund", "card"]
+    assert questions["decision_2"]["criteria"] == ["Bad", "Okay", "Good"]  # sorted by value
+    assert labels["decision_2"] == {"0": 0.25, "1": 0.75, "2": 0.0} and ids[1] == ["lo", "mid", "hi"]
+    assert questions["decision_3"]["criteria"] == {"true": "Urgent", "false": "Can wait"}
+    assert labels["decision_3"] == {"true": 0.7, "false": 0.3}
+    assert case_from_row(row, "noul")["questions"][0]["id"] == "urgent"
