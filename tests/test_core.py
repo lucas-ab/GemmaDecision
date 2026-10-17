@@ -228,3 +228,53 @@ def test_s1mb_render_anonymizes_choice_and_orders_score():
     assert questions["decision_3"]["criteria"] == {"true": "Urgent", "false": "Can wait"}
     assert labels["decision_3"] == {"true": 0.7, "false": 0.3}
     assert case_from_row(row, "noul")["questions"][0]["id"] == "urgent"
+
+
+def test_serve_decide_request_to_example_and_back():
+    from gemma_decision.serve import DecideRequest, decide_example, decide_output
+
+    req = DecideRequest(state={"b": 1, "a": "x"}, questions={
+        "route": {"type": "choice", "instructions": "Team?", "criteria": {"billing": "Money", "tech": "Bugs"}},
+        "urgent": {"type": "noul", "instructions": "Urgent."},
+        "level": {"type": "score", "instructions": "How bad?", "criteria": ["low", "mid", "high"]}},
+        images=["data:image/png;base64,iVBORw0KGgo="])
+    ex = decide_example(req)
+    assert ex.state == '{"a": "x", "b": 1}\nImage: <|image|>' and ex.images == [b"\x89PNG\r\n\x1a\n"]
+    assert [q.keys for q in ex.questions] == [["billing", "tech"], ["true", "false"], ["0", "1", "2"]]
+    recs = [{"question": "route", "type": "choice", "keys": ["billing", "tech"], "probs": [0.8, 0.2]},
+            {"question": "urgent", "type": "noul", "keys": ["true", "false"], "probs": [0.3, 0.7]},
+            {"question": "level", "type": "score", "keys": ["0", "1", "2"], "probs": [0.0, 0.5, 0.5]}]
+    out = decide_output(recs)
+    assert out["route"]["label"] == "billing" and out["urgent"]["probability_true"] == 0.3
+    assert out["level"]["score"] == 1.5
+
+
+def test_serve_systemone_maps_back_to_option_ids():
+    from gemma_decision.s1mb_format import split_case, to_example
+    from gemma_decision.serve import SystemOneRequest, systemone_case, systemone_output
+
+    req = SystemOneRequest(state="hi", decisions=[
+        {"id": "q", "type": "score", "instructions": "Rate.",
+         "criteria": [{"id": "hi", "description": "good", "value": 10}, {"id": "lo", "description": "bad", "value": 0}]}])
+    (part,) = [to_example(p) for p in split_case(systemone_case(req))]
+    ex, qs, ids = part
+    assert ex.questions[0].texts == ["bad", "good"] and ids == [["lo", "hi"]]
+    out = systemone_output([(qs, ids)], [[{"probs": [0.25, 0.75]}]])
+    assert out["q"]["probabilities"] == {"lo": 0.25, "hi": 0.75} and out["q"]["selected"] == "hi"
+    assert out["q"]["score"] == 7.5 and out["q"]["normalized_score"] == 0.75
+
+
+def test_serve_pad_batch_buckets_shapes():
+    from transformers import AutoTokenizer
+
+    from gemma_decision.data import collate, encode, parse_questions
+    from gemma_decision.serve import pad_batch
+
+    tok = AutoTokenizer.from_pretrained("google/embeddinggemma-2")
+    qs = parse_questions({"a": {"type": "choice", "instructions": "x", "criteria": {"p": "1", "q": "2", "r": "3"}}})
+    b = collate([encode(tok, "hello", qs, 512)], tok.pad_token_id)
+    b.pop("q_meta")
+    p = pad_batch(b, tok.pad_token_id)
+    assert p["input_ids"].shape[1] == 64 and p["attention_mask"][0, b["input_ids"].shape[1]:].sum() == 0
+    assert p["slot_weights"].shape[1:] == (8, 64) and p["slot_kind"].shape[1] == 8
+    assert p["q_opt_mask"].shape[1] == 4 and not p["q_opt_mask"][0, 3]

@@ -150,6 +150,24 @@ GPU choice (`modal_app.py::bench`, full fine-tune, batch 16, bf16, 2026-10-14 pr
 (call audio + transcript) and CORD-v2 (receipt image + OCR), each row rendered as text / media / both.
 See `data/mm-decisions/README.md` for licenses (the CrisisMMD part is CC BY-NC-SA 4.0).
 
+## API server (`gd-serve`)
+
+```bash
+uv run gd-serve --run runs/broad            # http://127.0.0.1:8780: playground at /, OpenAPI docs at /docs
+uv run gd-serve --run runs/broad --host 0.0.0.0   # reachable from the network; set GD_API_KEY to require a key
+```
+
+- `POST /v1/decide`: `{state, questions: {name: {type, instructions, criteria}}, images?, audio?}`. Choice
+  criteria are `{key: description}`, Noul `{true, false}` (optional), Score a list of level descriptions,
+  lowest first. Images and audio are base64; put `<|image|>` / `<|audio|>` in the state, or they are appended.
+  Returns per question `label`, `confidence`, `probabilities`, plus `probability_true` (Noul) or `score`
+  (expected level, Score).
+- `POST /v1/systemone`: the System One / S1MB format (`decisions` with criteria `{id, description, value}`),
+  rendered exactly as in training; returns probabilities per option ID, `selected`, and the expected numeric
+  `score` for Score decisions.
+- One request runs at a time on the GPU; inputs over 8,192 tokens have the state cut at the end (`meta.truncated`).
+  Requests are not stored.
+
 ## Notes
 
 - Precision: fp32. `float16` breaks EmbeddingGemma-2 (per the model card); bf16 gave no speedup on M1.

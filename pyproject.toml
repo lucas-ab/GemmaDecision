@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
     "datasets>=5.1.0",
+    "fastapi>=0.115",
     "librosa>=1.0.0",
     "peft>=0.21",
     "pillow>=12.3.0",
@@ -19,6 +20,7 @@ dependencies = [
     "torchvision>=0.29.1",
     "tqdm>=4.70.1",
     "transformers>=5.19",
+    "uvicorn>=0.30",
 ]
 
 [build-system]
@@ -41,3 +43,4 @@ gd-mm-probe = "gemma_decision.mm_probe:main"
 gd-score-external = "gemma_decision.external:main"
 gd-pilot-build = "gemma_decision.pilot_build:main"
 gd-synth-build = "gemma_decision.synth_build:main"
+gd-serve = "gemma_decision.serve:main"

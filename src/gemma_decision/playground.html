@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decision Playground</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --ink: #1d1d1b; --ink-2: #5c5c57; --ink-3: #8b8b85;
+  --line: #e3e3de; --accent: #2a5bd7; --accent-soft: #e6edfb; --bar: #2a5bd7; --bar-bg: #ecece8;
+  --good: #1f7a4d; --warn: #9a6400; --bad: #b3261e; --code: #f1f1ee;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --ink-2: #b2b1aa; --ink-3: #85847e;
+    --line: #2f2f2c; --accent: #7aa2ff; --accent-soft: #1e2a45; --bar: #7aa2ff; --bar-bg: #2a2a27;
+    --good: #5fc48f; --warn: #e0a84a; --bad: #f08a80; --code: #232321;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --ink-2: #b2b1aa; --ink-3: #85847e;
+  --line: #2f2f2c; --accent: #7aa2ff; --accent-soft: #1e2a45; --bar: #7aa2ff; --bar-bg: #2a2a27;
+  --good: #5fc48f; --warn: #e0a84a; --bad: #f08a80; --code: #232321;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.pill { font-size: 12px; color: var(--ink-2); background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; }
+.spacer { flex: 1; }
+a { color: var(--accent); }
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); margin: 0 0 10px; font-weight: 600; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+select, input[type=text], input[type=password], button, textarea { font: inherit; color: var(--ink); }
+select, input[type=text], input[type=password] { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+textarea { width: 100%; min-height: 420px; resize: vertical; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+button.ghost { background: transparent; color: var(--ink-2); border: 1px solid var(--line); font-weight: 500; }
+button:disabled { opacity: .5; cursor: progress; }
+label.file { font-size: 13px; color: var(--ink-2); display: inline-flex; gap: 6px; align-items: center; }
+.hint { color: var(--ink-3); font-size: 12px; }
+.err { color: var(--bad); white-space: pre-wrap; font-size: 13px; }
+.q { border-top: 1px solid var(--line); padding: 12px 0 4px; }
+.q:first-child { border-top: 0; padding-top: 0; }
+.qhead { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+.qname { font-weight: 600; }
+.qtype { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; }
+.answer { margin-left: auto; font-weight: 600; }
+.opt { display: grid; grid-template-columns: minmax(80px, 34%) 1fr 54px; gap: 8px; align-items: center; margin: 3px 0; font-size: 13px; }
+.opt .k { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.opt.top .k { color: var(--ink); font-weight: 600; }
+.track { height: 10px; background: var(--bar-bg); border-radius: 4px; overflow: hidden; }
+.fill { height: 100%; background: var(--bar); border-radius: 4px; min-width: 2px; }
+.opt .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin-bottom: 10px; }
+.meta b { color: var(--ink); font-weight: 600; }
+.warn { color: var(--warn); }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; font-size: 12px; max-height: 420px; }
+.empty { color: var(--ink-3); padding: 30px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Decision Playground</h1>
+  <span class="pill" id="model">connecting…</span>
+  <span class="spacer"></span>
+  <a href="/docs" target="_blank" rel="noopener">API docs</a>
+  <button class="ghost" id="theme" title="Toggle theme">Theme</button>
+</header>
+<main>
+  <section>
+    <h2>Request</h2>
+    <div class="row">
+      <select id="preset" aria-label="Preset"></select>
+      <select id="endpoint" aria-label="Endpoint">
+        <option value="/v1/decide">/v1/decide</option>
+        <option value="/v1/systemone">/v1/systemone</option>
+      </select>
+      <input type="password" id="key" placeholder="API key (if set)" aria-label="API key" size="14">
+    </div>
+    <textarea id="body" spellcheck="false" aria-label="Request JSON"></textarea>
+    <div class="row" style="margin-top:10px">
+      <label class="file">Images <input type="file" id="images" accept="image/*" multiple></label>
+      <label class="file">Audio <input type="file" id="audio" accept="audio/*" multiple></label>
+    </div>
+    <div class="row">
+      <button id="send">Decide</button>
+      <label class="file"><input type="checkbox" id="calibrated" checked> calibrated</label>
+      <span class="hint">⌘/Ctrl + Enter to send. Media is appended to the state unless you place &lt;|image|&gt; / &lt;|audio|&gt; yourself (/v1/decide only).</span>
+    </div>
+  </section>
+  <section>
+    <h2>Result</h2>
+    <div id="out"><div class="empty">Pick a preset or paste your own case, then press Decide.</div></div>
+    <div class="row"><button class="ghost" id="rawbtn" hidden>Show raw JSON</button></div>
+    <pre id="raw" hidden></pre>
+  </section>
+</main>
+<script>
+const PRESETS = {
+  "Support ticket routing (choice + noul + score)": ["/v1/decide", {
+    state: { channel: "email", customer_tier: "business", message: "Hi, we were charged twice for the October invoice (#4471) and our finance team needs a corrected receipt before Friday's audit. Can someone fix this today?" },
+    questions: {
+      route: { type: "choice", instructions: "Which team should handle this ticket?",
+        criteria: { billing: "Charges, refunds, invoices and receipts.", technical: "Bugs, outages, integrations.", account: "Login, users, permissions.", sales: "New purchases, upgrades, pricing questions." } },
+      refund_requested: { type: "noul", instructions: "The customer is asking for money back.",
+        criteria: { true: "The customer wants a refund or a reversed charge.", false: "No refund or reversal is requested." } },
+      urgency: { type: "score", instructions: "How urgent is this ticket?",
+        criteria: ["Not urgent: can wait a week.", "Normal: handle within two days.", "High: handle today.", "Critical: business is blocked right now."] } } }],
+  "Content moderation (noul)": ["/v1/decide", {
+    state: "User comment: \"If you don't take this post down I'll find where you live.\"",
+    questions: { threat: { type: "noul", instructions: "The comment threatens violence or harm against a person.",
+      criteria: { true: "Contains a threat of violence or harm.", false: "No threat of violence or harm." } } } }],
+  "Answer quality (score)": ["/v1/decide", {
+    state: { question: "How do I reset my router?", answer: "Unplug it for 30 seconds, plug it back in, and wait two minutes for the lights to settle. If that fails, hold the reset button for 10 seconds; this restores factory settings." },
+    questions: { helpfulness: { type: "score", instructions: "How helpful is the answer to the question?",
+      criteria: ["Not helpful.", "Slightly helpful.", "Partially helpful.", "Mostly helpful.", "Fully helpful and accurate."] } } }],
+  "Retrieval relevance (score)": ["/v1/decide", {
+    state: { query: "side effects of ibuprofen", document: "Ibuprofen can cause stomach upset, heartburn and, with long-term use, a higher risk of ulcers and kidney problems." },
+    questions: { relevance: { type: "score", instructions: "How relevant is the document to the query?",
+      criteria: ["Irrelevant.", "Related topic but does not answer.", "Partially answers.", "Directly and fully answers."] } } }],
+  "Image question (attach an image)": ["/v1/decide", {
+    state: "A photo taken by a delivery driver at drop-off.",
+    questions: { delivered: { type: "noul", instructions: "A package is visible at the door.",
+      criteria: { true: "A package or parcel is visible.", false: "No package is visible." } } } }],
+  "System One / S1MB format": ["/v1/systemone", {
+    state: { utterance: "How long does a card delivery take?" },
+    decisions: [{ id: "intent", type: "choice", instructions: "Identify the banking intent expressed by the utterance.",
+      criteria: [ { id: "card_arrival", description: "card arrival or delivery time" }, { id: "card_not_working", description: "card not working" },
+                  { id: "order_physical_card", description: "order physical card" }, { id: "top_up_limits", description: "top up limits" } ] }] }],
+};
+const $ = (id) => document.getElementById(id);
+const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+                set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+function applyTheme(t) { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
+applyTheme(store.get("theme", ""));
+$("theme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark"; applyTheme(next); store.set("theme", next);
+};
+
+for (const name of Object.keys(PRESETS)) $("preset").add(new Option(name, name));
+function loadPreset(name) {
+  const [ep, body] = PRESETS[name]; $("endpoint").value = ep; $("body").value = JSON.stringify(body, null, 2);
+}
+$("preset").onchange = () => loadPreset($("preset").value);
+const draft = store.get("draft", "");
+if (draft) { $("body").value = draft; $("endpoint").value = store.get("endpoint", "/v1/decide"); } else loadPreset(Object.keys(PRESETS)[0]);
+$("body").oninput = () => store.set("draft", $("body").value);
+$("endpoint").onchange = () => store.set("endpoint", $("endpoint").value);
+$("key").value = store.get("key", "");
+$("key").oninput = () => store.set("key", $("key").value);
+
+fetch("/health").then(r => r.json()).then(h => {
+  const t = h.temperatures || {};
+  $("model").textContent = `${(h.run || "").split("/").pop()} · ${h.device} · ${h.mode}` + (t.choice ? ` · T ${(+t.choice).toFixed(2)}/${(+t.noul).toFixed(2)}/${(+t.score).toFixed(2)}` : "");
+}).catch(() => { $("model").textContent = "server not reachable"; });
+
+const toB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const pct = (p) => (100 * p).toFixed(1) + "%";
+
+function bars(probs, top, labels) {
+  return Object.entries(probs).sort((a, b) => b[1] - a[1]).map(([k, p]) =>
+    `<div class="opt${k === top ? " top" : ""}"><span class="k" title="${esc(labels?.[k] ?? k)}">${esc(labels?.[k] ?? k)}</span>` +
+    `<span class="track"><span class="fill" style="width:${(100 * p).toFixed(1)}%"></span></span><span class="v">${pct(p)}</span></div>`).join("");
+}
+
+function render(ep, req, data) {
+  const m = data.meta || {};
+  let html = `<div class="meta"><span><b>${m.latency_ms ?? "–"}</b> ms</span><span><b>${(m.input_tokens || []).join(" + ")}</b> tokens</span>` +
+             (m.truncated ? `<span class="warn">${esc(m.note)}</span>` : "") + `</div>`;
+  if (ep === "/v1/decide") {
+    for (const [name, q] of Object.entries(data.questions)) {
+      const crit = req.questions?.[name]?.criteria;
+      let labels = null, answer = `${esc(q.label)} · ${pct(q.confidence)}`;
+      if (q.type === "score" && Array.isArray(crit)) { labels = Object.fromEntries(crit.map((c, i) => [String(i), `${i}: ${c}`])); answer = `score ${q.score.toFixed(2)} of ${crit.length - 1}`; }
+      if (q.type === "noul") answer = `p(true) = ${pct(q.probability_true)}`;
+      html += `<div class="q"><div class="qhead"><span class="qname">${esc(name)}</span><span class="qtype">${q.type}</span><span class="answer">${answer}</span></div>${bars(q.probabilities, q.label, labels)}</div>`;
+    }
+  } else {
+    for (const [id, d] of Object.entries(data.decisions)) {
+      let answer = esc(d.selected);
+      if (d.type === "score") answer = `score ${d.score.toFixed(2)} (${pct(d.normalized_score)})`;
+      if (d.type === "noul") answer = `p(true) = ${pct(d.probability_true)}`;
+      html += `<div class="q"><div class="qhead"><span class="qname">${esc(id)}</span><span class="qtype">${d.type}</span><span class="answer">${answer}</span></div>${bars(d.probabilities, d.selected)}</div>`;
+    }
+  }
+  $("out").innerHTML = html;
+}
+
+async function send() {
+  const ep = $("endpoint").value;
+  let req;
+  try { req = JSON.parse($("body").value); } catch (e) { $("out").innerHTML = `<div class="err">Invalid JSON: ${esc(e.message)}</div>`; return; }
+  req.calibrated = $("calibrated").checked;
+  if (ep === "/v1/decide") {
+    const imgs = [...$("images").files], auds = [...$("audio").files];
+    if (imgs.length) req.images = await Promise.all(imgs.map(toB64));
+    if (auds.length) req.audio = await Promise.all(auds.map(toB64));
+  }
+  $("send").disabled = true; $("out").innerHTML = `<div class="empty">Thinking…</div>`;
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if ($("key").value) headers.Authorization = `Bearer ${$("key").value}`;
+    const r = await fetch(ep, { method: "POST", headers, body: JSON.stringify(req) });
+    const data = await r.json();
+    $("raw").textContent = JSON.stringify(data, null, 2); $("rawbtn").hidden = false;
+    if (!r.ok) { $("out").innerHTML = `<div class="err">${r.status}: ${esc(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail, null, 2))}</div>`; return; }
+    render(ep, req, data);
+  } catch (e) { $("out").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  finally { $("send").disabled = false; }
+}
+$("send").onclick = send;
+$("body").onkeydown = (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send(); };
+$("rawbtn").onclick = () => { const h = $("raw").hidden; $("raw").hidden = !h; $("rawbtn").textContent = h ? "Hide raw JSON" : "Show raw JSON"; };
+</script>
+</body>
+</html>
