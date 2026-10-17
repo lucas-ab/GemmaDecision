@@ -172,13 +172,19 @@ uv run gd-serve --run runs/broad --host 0.0.0.0   # reachable from the network; 
   pixels and audio features on the CPU. `--mlx-dtype float16` is ~15-20% faster (same top-1 on every check).
   Parity with PyTorch: `scripts/mlx_parity.py` (text) and `scripts/mlx_parity_media.py` (images, audio):
   fp32 probabilities within 1e-5 and the same top-1 on all 156 text and 96 image/audio questions.
-  Speed (M1 Max, `broad`, `scripts/bench_backends.py`):
+  Speed (M1 Max, `broad`; text from `scripts/bench_backends.py`, media from `scripts/mlx_parity_media.py`,
+  both with matched warm-up; media times exclude CPU preprocessing):
 
-  | backend | 512 tok | 1,024 | 2,048 | 4,096 | unseen length med/p90 | image | audio clip | peak GB |
-  |---|---|---|---|---|---|---|---|---|
-  | PyTorch MPS fp32 (bucketed padding) | 95 ms | 205 | 522 | 1,616 | 85 / 148 | ~430 ms | ~170-230 ms | 19.2 |
-  | MLX fp32 (mlx-vlm) | 54 ms | 108 | 259 | 721 | 52 / 83 | ~340 ms | ~85-290 ms | 6.3 |
-  | MLX fp16 (mlx-vlm) | 45 ms | 88 | 205 | 556 | 46 / 74 | ~280 ms | ~60-110 ms | 6.0 |
+  | backend | 512 tok | 1,024 | 2,048 | 4,096 | unseen length med/p90 | image | audio clip |
+  |---|---|---|---|---|---|---|---|
+  | PyTorch MPS fp32 (bucketed padding) | 95 ms | 205 | 520 | 1,615 | 78 / 149 | 425-525 ms | 125-570 ms |
+  | MLX fp32 | 58 ms | 113 | 268 | 728 | 45 / 75 | 340-370 ms | 60-415 ms |
+  | MLX fp16 | 52 ms | 98 | 225 | 595 | 44 / 68 | ~275 ms | 58-380 ms |
+
+  Memory (text throughput run): weights 3.0 GB for PyTorch (1.9 GB of it the vision/audio towers, loaded but
+  unused for text) vs 1.1 GB for MLX's text-only port; peak live memory 7.6 GB vs 6.3 GB; both backends'
+  allocators then reserve 22-25 GB of cache. So MLX saves about 1.2 GB of live memory, not the 19 vs 6 GB an
+  earlier, non-comparable measurement suggested.
 
   Through the API (text, varied lengths): 36 ms median with MLX vs 58 ms with PyTorch.
 
