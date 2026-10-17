@@ -13,12 +13,16 @@ Endpoints
 Questions: type "choice" (criteria {key: description}), "noul" (yes/no; criteria {true, false} optional) or
 "score" (criteria = level descriptions, lowest first). Images and audio are base64 strings (data: URLs work);
 put <|image|> / <|audio|> in the state where each goes, or they are appended in order. Requests are not stored.
+
+Auth: with GD_API_KEY set, only the /v1/* endpoints require "Authorization: Bearer <key>" (compared in constant
+time); GET /health and GET / (the playground page) are always open.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import json
 import os
 import threading
@@ -32,8 +36,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .data import MAX_AUDIO_S, Example, _audio_seconds, _render, chunk_long_audio, media_reserve, parse_questions
-from .evaluate import run
-from .s1mb_format import split_case, to_example
+from .s1mb_format import _text, split_case, to_example
 
 PLAYGROUND = Path(__file__).with_name("playground.html")
 
@@ -106,8 +109,9 @@ def decide_example(req: DecideRequest) -> Example:
             raise HTTPException(422, f"{name}: choice criteria must be {{key: description}}")
         if q.type == "score" and not isinstance(crit, list):
             raise HTTPException(422, f"{name}: score criteria must be a list of level descriptions")
-        if q.type == "noul" and crit is not None and set(crit) != {"true", "false"}:
-            raise HTTPException(422, f"{name}: noul criteria must have exactly the keys true and false")
+        if q.type == "noul" and crit is not None and (not isinstance(crit, dict) or set(crit) != {"true", "false"}):
+            raise HTTPException(422, f"{name}: noul criteria must be omitted or an object with exactly the keys "
+                                     f"true and false")
         if q.type in ("choice", "score") and len(crit) < 2:
             raise HTTPException(422, f"{name}: at least two options are required")
         if q.type == "score" and len(crit) > 16:
@@ -137,9 +141,14 @@ def decide_output(records: list[dict]) -> dict:
     return out
 
 
+def _value_text(v) -> str:
+    """Render a decoded JSON value exactly as training did: strings as-is, anything else as compact sorted JSON.
+    The rendering lives in s1mb_format._text (which takes the JSON text of the value)."""
+    return _text(json.dumps(v))
+
+
 def systemone_case(req: SystemOneRequest) -> dict:
-    def text(v):
-        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    text = _value_text
 
     qs = []
     for d in req.decisions:
@@ -275,55 +284,39 @@ class Engine:
                 for q in qs:
                     q.target = [1 / len(q.keys)] * len(q.keys)
                 state = "word " * max(1, T - 40 - 25 * n_q)
-                self._text_forward(Example(id="warmup", workflow="api", state=state[: 4 * T], questions=qs), True)
+                self._forward(Example(id="warmup", workflow="api", state=state[: 4 * T], questions=qs), True)
         return round(time.perf_counter() - t0, 1)
 
     @torch.inference_mode()
-    def _text_forward(self, ex: Example, calibrated: bool) -> list[dict]:
-        from .data import collate, encode
+    def _forward(self, ex: Example, calibrated: bool) -> tuple[list[dict], int, bool]:
+        """One example -> (records, prompt tokens, state text was cut). Tokenizes once (inside encode)."""
+        from .data import collate, collate_mm, encode
         from .model import probabilities, to_device
 
-        enc = encode(self.tok, ex.state, ex.questions, self.max_length)
-        batch = collate([enc], self.tok.pad_token_id)
+        media = bool(ex.images or ex.audio)
+        reserve = media_reserve(ex) if media else 0  # a placeholder counts as 1 token in encode(); it expands later
+        enc = encode(self.tok, ex.state, ex.questions, self.max_length, reserve=reserve)
+        # encode() only changes the prompt text by cutting the state, so a plain string compare detects truncation
+        truncated = enc.text != _render(ex.state, ex.questions)[0]
+        batch = collate_mm([enc], [ex], self.processor) if media else collate([enc], self.tok.pad_token_id)
         meta = batch.pop("q_meta")
         if self.mlx is not None:  # MLX compiles kernels per op, not per shape: no padding needed
-            probs = torch.from_numpy(self.mlx_thread.submit(self.mlx.probabilities, batch, calibrated).result())
+            probs = self.mlx_thread.submit(self.mlx.probabilities, batch, calibrated).result()
         else:
-            logits = self.model(to_device(pad_batch(batch, self.tok.pad_token_id), self.device), calibrated=calibrated)
+            if not media:  # pad_batch only handles text batches (no media keys); it buckets shapes for MPS/CUDA
+                batch = pad_batch(batch, self.tok.pad_token_id)
+            logits = self.model(to_device(batch, self.device), calibrated=calibrated)
             probs = probabilities(logits.float()).cpu()
-        return [{"question": q.name, "type": q.type, "keys": q.keys, "probs": probs[j, : len(q.keys)].tolist()}
-                for j, (_, q) in enumerate(meta)]
-
-    def _media_forward_mlx(self, ex: Example, calibrated: bool) -> list[dict]:
-        from .data import collate_mm, encode
-
-        enc = encode(self.tok, ex.state, ex.questions, self.max_length, reserve=media_reserve(ex))
-        batch = collate_mm([enc], [ex], self.processor)
-        meta = batch.pop("q_meta")
-        probs = self.mlx_thread.submit(self.mlx.probabilities, batch, calibrated).result()
-        return [{"question": q.name, "type": q.type, "keys": q.keys, "probs": probs[j, : len(q.keys)].tolist()}
-                for j, (_, q) in enumerate(meta)]
+        return _records(meta, probs), len(enc.input_ids) + reserve, truncated
 
     def infer(self, examples: list[Example], calibrated: bool) -> tuple[list[list[dict]], dict]:
         t0 = time.perf_counter()
         tokens, truncated = [], 0
-        for ex in examples:
-            n = len(self.tok(_render(ex.state, ex.questions)[0])["input_ids"])
-            if ex.images or ex.audio:  # each placeholder expands to ~280 image / 25-per-second audio tokens
-                n += media_reserve(ex)
-            tokens.append(n)
-            truncated += n > self.max_length
         with self.lock:
             out = []
             for ex in examples:
                 try:
-                    if (ex.images or ex.audio) and self.mlx is not None:
-                        recs = self._media_forward_mlx(ex, calibrated)
-                    elif ex.images or ex.audio:
-                        recs, _ = run(self.model, self.tok, [ex], self.torch_device, 1, self.max_length,
-                                      calibrated, self.processor)
-                    else:
-                        recs = self._text_forward(ex, calibrated)
+                    recs, n_tokens, cut = self._forward(ex, calibrated)
                 except ValueError as err:  # encode(): questions and options alone exceed max_length
                     raise HTTPException(422, str(err)) from err
                 except RuntimeError as err:
@@ -333,6 +326,8 @@ class Engine:
                 if not recs:
                     raise HTTPException(422, "the questions and options alone exceed max_length")
                 out.append(recs)
+                tokens.append(n_tokens)  # media requests include the tokens their placeholders expand into
+                truncated += cut
         meta = {"input_tokens": tokens, "truncated": bool(truncated),
                 "latency_ms": round(1000 * (time.perf_counter() - t0), 1), "run": self.run_dir.name}
         if truncated:
@@ -340,12 +335,25 @@ class Engine:
         return out, meta
 
 
+def _records(meta, probs) -> list[dict]:
+    """One record per question from collate()'s q_meta [(row, Question)] and the [Q, K] probabilities."""
+    return [{"question": q.name, "type": q.type, "keys": q.keys, "probs": probs[j, : len(q.keys)].tolist()}
+            for j, (_, q) in enumerate(meta)]
+
+
+def _key_ok(authorization: str | None, api_key: str | None) -> bool:
+    """Constant-time check of "Bearer <key>"; always true when no key is configured."""
+    if not api_key:
+        return True
+    return hmac.compare_digest((authorization or "").encode(), f"Bearer {api_key}".encode())
+
+
 def create_app(engine: Engine | None, api_key: str | None = None) -> FastAPI:
     app = FastAPI(title="GemmaDecision API", version="1.0",
                   description="EmbeddingGemma-2 + Clef-style decision head. Choice / Noul / Score decisions.")
 
     def auth(authorization: str | None = Header(default=None)):
-        if api_key and authorization != f"Bearer {api_key}":
+        if not _key_ok(authorization, api_key):
             raise HTTPException(401, "missing or wrong API key")
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
