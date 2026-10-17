@@ -11,10 +11,61 @@ Borda is also printed without them to check the reproduction.
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 DISPLAY = Path("data/s1mb/leaderboard/display.json")
+
+
+def _succeeded(result):
+    counts = result.get("counts") or {}
+    return counts.get("succeeded") or 0
+
+
+def collect_scores(payload, bench_ids):
+    """Measured, complete scores per (model index, benchmark id) -> (scores, duplicates).
+
+    Results carry no timestamp or dataset revision, only counts, so when the same (model, benchmark) has more
+    than one measured complete result the one with the most succeeded decisions wins, and among equals the
+    later one in the list (the previous overwrite behavior). `duplicates` is the number of surplus results."""
+    best = {}
+    duplicates = 0
+    for r in payload["results"]:
+        b = r["benchmark"]
+        bid = payload["benchmarks"][b]["id"] if isinstance(b, int) else b["id"]
+        if bid not in bench_ids or r["provenance"] != "measured" or r["status"] != "complete":
+            continue
+        key = (r["model"], bid)
+        if key in best:
+            duplicates += 1
+            if _succeeded(r) < _succeeded(best[key]):
+                continue
+        best[key] = r
+    scores = defaultdict(dict)
+    for (model, bid), r in best.items():
+        scores[model][bid] = r["metrics"].get("baseline_adjusted_score")
+    return scores, duplicates
+
+
+def build_models(payload, bench_ids):
+    """Complete models (a score on every benchmark) keyed "name [run_id]"; warns on duplicate results or keys."""
+    scores, duplicates = collect_scores(payload, bench_ids)
+    if duplicates:
+        print(f"warning: {duplicates} duplicate measured result(s) for the same model and benchmark in "
+              f"display.json; kept the one with the most succeeded decisions (ties: the later)", file=sys.stderr)
+    models = {}
+    for i, m in enumerate(payload["models"]):
+        s = scores.get(i, {})
+        if len(s) == len(bench_ids) and all(v is not None for v in s.values()):
+            info = m["model"]
+            name = info.get("display_name") or info["id"]
+            key = f"{name} [{m['run_id']}]"
+            if key in models:
+                print(f"warning: duplicate complete model entry {key!r} (index {i}); keeping the later one",
+                      file=sys.stderr)
+            models[key] = {"scores": s, "total_params": info.get("total_params")}
+    return models
 
 
 def published(category="english-v1"):
@@ -22,20 +73,7 @@ def published(category="english-v1"):
     cat = next(c for c in p["categories"] if c["id"] == category)
     bench_ids = cat["benchmarks"]
     task_of = {b["id"]: b["task"] for b in p["benchmarks"]}
-    scores = defaultdict(dict)
-    for r in p["results"]:
-        bid = p["benchmarks"][r["benchmark"]]["id"] if isinstance(r["benchmark"], int) else r["benchmark"]["id"]
-        if bid not in bench_ids or r["provenance"] != "measured" or r["status"] != "complete":
-            continue
-        scores[r["model"]][bid] = r["metrics"].get("baseline_adjusted_score")
-    models = {}
-    for i, m in enumerate(p["models"]):
-        s = scores.get(i, {})
-        if len(s) == len(bench_ids) and all(v is not None for v in s.values()):
-            info = m["model"]
-            name = info.get("display_name") or info["id"]
-            models[f"{name} [{m['run_id']}]"] = {"scores": s, "total_params": info.get("total_params")}
-    return bench_ids, task_of, models
+    return bench_ids, task_of, build_models(p, bench_ids)
 
 
 def task_avg(scores, bench_ids, task_of):
@@ -77,8 +115,12 @@ def main():
     ours = {}
     for run in args.runs:
         s = json.loads((run / "s1mb" / "summary.json").read_text())
-        if not s["complete"] or s["benchmarks"] != len(bench_ids):
-            raise SystemExit(f"{run}: incomplete S1MB run ({s['benchmarks']} benchmarks, complete={s['complete']})")
+        if (not s["complete"] or s["benchmarks"] != len(bench_ids)
+                or any(v is None for v in s["per_benchmark"].values())):
+            missing = sorted(b for b, v in s["per_benchmark"].items() if v is None)
+            raise SystemExit(f"{run}: incomplete S1MB run ({s['benchmarks']} of {len(bench_ids)} benchmarks, "
+                             f"complete={s['complete']}, {len(missing)} without a score"
+                             + (f": {', '.join(missing[:5])}" if missing else "") + "); rerun scripts/s1mb_bench.py")
         ours[f"OURS {run.name}"] = {"scores": s["per_benchmark"], "total_params": None}
     cohort = {**models, **ours}
     b_all = borda(cohort, bench_ids)

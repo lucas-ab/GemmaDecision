@@ -48,14 +48,18 @@ def to_examples(case: dict):
 
 
 def metrics(cases: list[dict], preds: dict, task: str) -> dict:
-    """S1MB primary metric + baseline-adjusted score; `preds[(case, question)] = {option_id: p}`."""
+    """S1MB primary metric + baseline-adjusted score; `preds[(case, question)] = {option_id: p}`.
+
+    Baselines depend only on the benchmark entries, never on predictions. With no answered decisions
+    (every case failed) the prediction-based metrics and scores are None, so the run continues and the
+    summary marks it incomplete."""
     entries = [(q, c["targets"][q["id"]]) for c in cases for q in c["questions"]]
     rows = [(q, c["targets"][q["id"]], preds[(c["id"], q["id"])])
             for c in cases for q in c["questions"] if (c["id"], q["id"]) in preds]
     n = len(rows)
     out = {"decisions": len(entries), "answered": n}
     if task == "noul":
-        prevalence = sum(t["true"] for _, t in entries) / len(entries)
+        prevalence = sum(t["true"] for _, t in entries) / len(entries) if entries else None
         tp = sum(t["true"] for _, t, p in rows if p["true"] >= 0.5)
         fp = sum(t["false"] for _, t, p in rows if p["true"] >= 0.5)
         fn = sum(t["true"] for _, t, p in rows if p["true"] < 0.5)
@@ -63,21 +67,23 @@ def metrics(cases: list[dict], preds: dict, task: str) -> dict:
         recall = tp / (tp + fn) if tp + fn > EPS else None
         spec = tn / (tn + fp) if tn + fp > EPS else None
         ba = (recall + spec) / 2 if recall is not None and spec is not None else None
-        out.update(binary_brier=sum((p["true"] - t["true"]) ** 2 for _, t, p in rows) / n,
-                   accuracy=(tp + tn) / n, balanced_accuracy=ba, positive_prevalence=prevalence)
+        out.update(binary_brier=sum((p["true"] - t["true"]) ** 2 for _, t, p in rows) / n if n else None,
+                   accuracy=(tp + tn) / n if n else None, balanced_accuracy=ba, positive_prevalence=prevalence)
         skill = 2 * ba - 1 if ba is not None else None
     elif task == "choice":
-        uniform = sum(1 / len(q["options"]) for q, _ in entries) / len(entries)
-        ids = {o["id"] for q, _ in entries for o in q["options"]}
-        fixed_id = max(sum(t.get(k, 1 / len(q["options"])) for q, t in entries) / len(entries) for k in ids)
-        fixed_pos = max(sum(t[q["options"][i]["id"]] if i < len(q["options"]) else 1 / len(q["options"])
-                            for q, t in entries) / len(entries)
-                        for i in range(max(len(q["options"]) for q, _ in entries)))
-        base = max(uniform, fixed_id, fixed_pos)
+        base = None
+        if entries:
+            uniform = sum(1 / len(q["options"]) for q, _ in entries) / len(entries)
+            ids = {o["id"] for q, _ in entries for o in q["options"]}
+            fixed_id = max(sum(t.get(k, 1 / len(q["options"])) for q, t in entries) / len(entries) for k in ids)
+            fixed_pos = max(sum(t[q["options"][i]["id"]] if i < len(q["options"]) else 1 / len(q["options"])
+                                for q, t in entries) / len(entries)
+                            for i in range(max(len(q["options"]) for q, _ in entries)))
+            base = max(uniform, fixed_id, fixed_pos)
         # argmax with ties resolved in the original candidate order
-        acc = sum(t[max(q["options"], key=lambda o: p[o["id"]])["id"]] for q, t, p in rows) / n
+        acc = sum(t[max(q["options"], key=lambda o: p[o["id"]])["id"]] for q, t, p in rows) / n if n else None
         out.update(target_mass_at_prediction=acc, fixed_answer_accuracy_baseline=base)
-        skill = (acc - base) / (1 - base) if base < 1 - EPS else None
+        skill = (acc - base) / (1 - base) if acc is not None and base is not None and base < 1 - EPS else None
     else:
         def norm_ev(q, probs):
             vals = {o["id"]: float(o["value"]) for o in q["options"]}
@@ -85,15 +91,17 @@ def metrics(cases: list[dict], preds: dict, task: str) -> dict:
             return sum((v - lo) / (hi - lo) * probs[k] for k, v in vals.items())
 
         targets = [norm_ev(q, t) for q, t in entries]
-        const = median(targets)
-        base = sum(abs(t - const) for t in targets) / len(targets)
+        base = None
+        if targets:
+            const = median(targets)
+            base = sum(abs(t - const) for t in targets) / len(targets)
         errs = []
         for q, t, p in rows:
             vals = {o["id"]: o["value"] for o in q["options"]}
             errs.append(sum(v * (p[k] - t[k]) for k, v in vals.items()) / (max(vals.values()) - min(vals.values())))
-        mae = sum(abs(e) for e in errs) / n
+        mae = sum(abs(e) for e in errs) / n if n else None
         out.update(normalized_expected_score_mae=mae, constant_mae_baseline=base)
-        skill = 1 - mae / base if base > EPS else None
+        skill = 1 - mae / base if mae is not None and base is not None and base > EPS else None
     out["baseline_adjusted_skill"] = skill
     out["baseline_adjusted_score"] = max(0.0, min(1.0, skill)) if skill is not None else None
     return out
@@ -196,6 +204,7 @@ def summarize(benches, results):
              for t in ("noul", "choice", "score")}
     general = {t: mean([results[b]["baseline_adjusted_score"] for b in results
                         if task_of[b] == t and b.startswith("s1mb-generalization-")]) for t in tasks}
+    # a benchmark with no answered decisions has a None score and fails answered == decisions
     complete = all(r["answered"] == r["decisions"] for r in results.values())
     return {
         "benchmarks": len(results), "complete": complete,
