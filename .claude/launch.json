@@ -27,6 +27,21 @@
         "8780"
       ],
       "port": 8780
+    },
+    {
+      "name": "api-mlx",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "gd-serve",
+        "--run",
+        "runs/broad",
+        "--backend",
+        "mlx",
+        "--port",
+        "8781"
+      ],
+      "port": 8781
     }
   ]
 }

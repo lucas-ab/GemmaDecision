@@ -165,6 +165,23 @@ uv run gd-serve --run runs/broad --host 0.0.0.0   # reachable from the network; 
 - `POST /v1/systemone`: the System One / S1MB format (`decisions` with criteria `{id, description, value}`),
   rendered exactly as in training; returns probabilities per option ID, `selected`, and the expected numeric
   `score` for Score decisions.
+- `--backend mlx` (Apple silicon) runs everything on MLX: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm)'s (MIT; it and its added dependencies are MIT, Apache-2.0 or BSD)
+  EmbeddingGemma-2 (text + Gemma 4 vision and audio towers) with our fine-tuned text weights swapped in, plus our
+  head ported to MLX ([mlx_backend.py](src/gemma_decision/mlx_backend.py); weights converted once to
+  `runs/<run>/mlx_text.safetensors`). No PyTorch model is loaded; the Hugging Face processor still prepares
+  pixels and audio features on the CPU. `--mlx-dtype float16` is ~15-20% faster (same top-1 on every check).
+  Parity with PyTorch: `scripts/mlx_parity.py` (text) and `scripts/mlx_parity_media.py` (images, audio):
+  fp32 probabilities within 1e-5 and the same top-1 on all 156 text and 96 image/audio questions.
+  Speed (M1 Max, `broad`, `scripts/bench_backends.py`):
+
+  | backend | 512 tok | 1,024 | 2,048 | 4,096 | unseen length med/p90 | image | audio clip | peak GB |
+  |---|---|---|---|---|---|---|---|---|
+  | PyTorch MPS fp32 (bucketed padding) | 95 ms | 205 | 522 | 1,616 | 85 / 148 | ~430 ms | ~170-230 ms | 19.2 |
+  | MLX fp32 (mlx-vlm) | 54 ms | 108 | 259 | 721 | 52 / 83 | ~340 ms | ~85-290 ms | 6.3 |
+  | MLX fp16 (mlx-vlm) | 45 ms | 88 | 205 | 556 | 46 / 74 | ~280 ms | ~60-110 ms | 6.0 |
+
+  Through the API (text, varied lengths): 36 ms median with MLX vs 58 ms with PyTorch.
+
 - One request runs at a time on the GPU; inputs over 8,192 tokens have the state cut at the end (`meta.truncated`).
   Requests are not stored.
 

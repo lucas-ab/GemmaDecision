@@ -278,3 +278,32 @@ def test_serve_pad_batch_buckets_shapes():
     assert p["input_ids"].shape[1] == 64 and p["attention_mask"][0, b["input_ids"].shape[1]:].sum() == 0
     assert p["slot_weights"].shape[1:] == (8, 64) and p["slot_kind"].shape[1] == 8
     assert p["q_opt_mask"].shape[1] == 4 and not p["q_opt_mask"][0, 3]
+
+
+
+def test_mlx_head_matches_torch_head():
+    mx = pytest.importorskip("mlx.core")
+    import numpy as np
+
+    from gemma_decision.data import collate, encode, parse_questions
+    from gemma_decision.mlx_backend import ClefHeadMLX
+    from gemma_decision.model import ClefHead
+    from transformers import AutoTokenizer
+
+    torch.manual_seed(0)
+    tok = AutoTokenizer.from_pretrained("google/embeddinggemma-2")
+    qs = parse_questions({**QUESTIONS, "urgent": {"type": "noul", "instructions": "Urgent."}})
+    b = collate([encode(tok, "hello there", qs, 256), encode(tok, "a longer case " * 20, qs, 256)], tok.pad_token_id)
+    b.pop("q_meta")
+    head = ClefHead().eval()
+    head.log_temp.copy_(torch.tensor([0.1, -0.2, 0.3]))
+    tokens = torch.randn(*b["input_ids"].shape, 768)
+    with torch.no_grad():
+        ref = head(tokens, b["attention_mask"], b).numpy()
+    mh = ClefHeadMLX({k: mx.array(v.numpy()) for k, v in head.state_dict().items()})
+    out = mh(mx.array(tokens.numpy()), mx.array(b["attention_mask"].numpy()),
+             {k: mx.array(v.numpy()) for k, v in b.items()})
+    out = np.array(out)
+    finite = np.isfinite(ref)
+    assert (finite == np.isfinite(out)).all()
+    assert np.abs(out[finite] - ref[finite]).max() < 1e-4

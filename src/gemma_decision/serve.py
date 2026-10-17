@@ -208,32 +208,61 @@ def pad_batch(batch: dict, pad_id: int) -> dict:
 
 
 class Engine:
-    """Inference for one run on PyTorch (MPS / CUDA / CPU)."""
+    """Inference for one run. backend "torch": PyTorch (MPS/CUDA/CPU). backend "mlx" (Apple silicon): mlx-vlm's
+    EmbeddingGemma-2 with our fine-tuned text weights + our head in MLX, for text, images and audio; no PyTorch
+    model is loaded (the Hugging Face processor still prepares pixels and audio features on the CPU)."""
 
-    def __init__(self, run_dir: Path, device: str | None, max_length: int):
+    def __init__(self, run_dir: Path, device: str | None, max_length: int, backend: str = "torch",
+                 mlx_dtype: str = "float32"):
         import yaml
-        from safetensors.torch import load_file
         from transformers import AutoProcessor, AutoTokenizer
 
-        from .train import build_model, pick_device
-
-        self.run_dir, self.max_length = run_dir, max_length
+        self.run_dir, self.max_length, self.backend, self.device_arg = run_dir, max_length, backend, device
         self.cfg = yaml.safe_load((run_dir / "config.yaml").read_text())
-        model = build_model(self.cfg)
-        _, unexpected = model.load_state_dict(load_file(run_dir / "trainable.safetensors"), strict=False)
-        if unexpected:
-            raise RuntimeError(f"unexpected keys in checkpoint: {unexpected[:5]}")
-        self.device = torch.device(device) if device else pick_device()
-        self.model = model.to(self.device).eval()
         self.tok = AutoTokenizer.from_pretrained(self.cfg["model_id"])
         self.processor = AutoProcessor.from_pretrained(self.cfg["model_id"])
         self.lock = threading.Lock()  # one forward pass at a time on the GPU
+        self.model = self.mlx = None
+        if backend == "mlx":
+            from concurrent.futures import ThreadPoolExecutor
+
+            import mlx.core as mx
+
+            from .mlx_backend import MLXDecisionModel
+
+            # MLX streams belong to the thread that created them (mlx-vlm makes one at import), so loading and
+            # every forward pass run on this one thread; FastAPI's request threads hand work to it.
+            self.mlx_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+            self.mlx = self.mlx_thread.submit(
+                MLXDecisionModel.load, run_dir, getattr(mx, mlx_dtype), encoder="vlm").result()
+            self.device = f"mlx-gpu ({mlx_dtype})"
+        elif backend == "torch":
+            self._torch()
+        else:
+            raise ValueError(f"unknown backend {backend!r}")
         meta = {}
         if (run_dir / "eval_test.json").exists():
             meta = json.loads((run_dir / "eval_test.json").read_text()).get("meta", {})
         self.info = {"run": str(run_dir), "model_id": self.cfg["model_id"], "mode": self.cfg["mode"],
-                     "device": str(self.device), "max_length": max_length,
+                     "backend": backend, "device": str(self.device), "max_length": max_length,
                      "temperatures": dict(zip(("choice", "noul", "score"), meta.get("temperatures") or [None] * 3))}
+
+    def _torch(self):
+        """The PyTorch model (backend torch)."""
+        if self.model is None:
+            from safetensors.torch import load_file
+
+            from .train import build_model, pick_device
+
+            model = build_model(self.cfg)
+            _, unexpected = model.load_state_dict(load_file(self.run_dir / "trainable.safetensors"), strict=False)
+            if unexpected:
+                raise RuntimeError(f"unexpected keys in checkpoint: {unexpected[:5]}")
+            self.torch_device = torch.device(self.device_arg) if self.device_arg else pick_device()
+            self.model = model.to(self.torch_device).eval()
+            if self.backend == "torch":
+                self.device = self.torch_device
+        return self.model
 
     def warmup(self, up_to: int = 1024):
         """Compile the common padded shapes once at startup (a few seconds) instead of on user requests."""
@@ -257,8 +286,21 @@ class Engine:
         enc = encode(self.tok, ex.state, ex.questions, self.max_length)
         batch = collate([enc], self.tok.pad_token_id)
         meta = batch.pop("q_meta")
-        logits = self.model(to_device(pad_batch(batch, self.tok.pad_token_id), self.device), calibrated=calibrated)
-        probs = probabilities(logits.float()).cpu()
+        if self.mlx is not None:  # MLX compiles kernels per op, not per shape: no padding needed
+            probs = torch.from_numpy(self.mlx_thread.submit(self.mlx.probabilities, batch, calibrated).result())
+        else:
+            logits = self.model(to_device(pad_batch(batch, self.tok.pad_token_id), self.device), calibrated=calibrated)
+            probs = probabilities(logits.float()).cpu()
+        return [{"question": q.name, "type": q.type, "keys": q.keys, "probs": probs[j, : len(q.keys)].tolist()}
+                for j, (_, q) in enumerate(meta)]
+
+    def _media_forward_mlx(self, ex: Example, calibrated: bool) -> list[dict]:
+        from .data import collate_mm, encode
+
+        enc = encode(self.tok, ex.state, ex.questions, self.max_length, reserve=media_reserve(ex))
+        batch = collate_mm([enc], [ex], self.processor)
+        meta = batch.pop("q_meta")
+        probs = self.mlx_thread.submit(self.mlx.probabilities, batch, calibrated).result()
         return [{"question": q.name, "type": q.type, "keys": q.keys, "probs": probs[j, : len(q.keys)].tolist()}
                 for j, (_, q) in enumerate(meta)]
 
@@ -275,9 +317,11 @@ class Engine:
             out = []
             for ex in examples:
                 try:
-                    if ex.images or ex.audio:
-                        recs, _ = run(self.model, self.tok, [ex], self.device, 1, self.max_length, calibrated,
-                                      self.processor)
+                    if (ex.images or ex.audio) and self.mlx is not None:
+                        recs = self._media_forward_mlx(ex, calibrated)
+                    elif ex.images or ex.audio:
+                        recs, _ = run(self.model, self.tok, [ex], self.torch_device, 1, self.max_length,
+                                      calibrated, self.processor)
                     else:
                         recs = self._text_forward(ex, calibrated)
                 except ValueError as err:  # encode(): questions and options alone exceed max_length
@@ -334,13 +378,16 @@ def main():
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--device", help="cuda / mps / cpu (default: best available)")
     ap.add_argument("--max-length", type=int, default=8192, help="model input limit (the encoder's context)")
+    ap.add_argument("--backend", choices=["torch", "mlx"], default="torch",
+                    help="mlx: everything on MLX via mlx-vlm (Apple silicon); torch: PyTorch")
+    ap.add_argument("--mlx-dtype", choices=["float32", "float16", "bfloat16"], default="float32")
     ap.add_argument("--warmup-tokens", type=int, default=1024, help="pre-compile padded shapes up to this length")
     ap.add_argument("--no-warmup", action="store_true")
     args = ap.parse_args()
     import uvicorn
 
-    engine = Engine(args.run, args.device, args.max_length)
-    if not args.no_warmup:
+    engine = Engine(args.run, args.device, args.max_length, args.backend, args.mlx_dtype)
+    if not args.no_warmup and args.backend == "torch":  # MLX does not compile per input shape
         print(f"warming up input shapes up to {args.warmup_tokens} tokens...", flush=True)
         print(f"warm-up took {engine.warmup(args.warmup_tokens)} s", flush=True)
     print(f"loaded {args.run} on {engine.device}; http://{args.host}:{args.port}  (docs: /docs)", flush=True)
