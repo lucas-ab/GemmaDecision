@@ -192,6 +192,9 @@ def encode(
         parts = re.split(PLACEHOLDER_RE, state)  # text, placeholder, text, placeholder, ...
         texts = parts[0::2]
         longest = max(range(len(texts)), key=lambda i: len(texts[i]))
+        # TODO: this over-cuts text with fewer than ~3 chars per token (numbers, code, CJK, repeated short words):
+        # a 20,000-token "x x x ..." state with max_length 8192 keeps only ~2,264 tokens. Size the cut from the
+        # tokenizer offsets (or the segment's measured chars per token) so the kept prompt ends near max_length.
         cut = max(overflow * 3, 16)  # ~3+ chars per token
         if cut >= len(texts[longest]):
             raise ValueError("prompt does not fit max_length even without state text")
