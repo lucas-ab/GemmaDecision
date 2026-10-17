@@ -13,6 +13,7 @@ runs/<run>/mlx_text.safetensors:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sys
@@ -23,6 +24,9 @@ import mlx.nn as nn
 import numpy as np
 
 WEIGHTS = "mlx_text.safetensors"
+CONFIG = "mlx_text_config.json"
+CONVERT_FORMAT = 1  # bump when the converted layout changes; older conversions are then reconverted
+SOURCES = ("trainable.safetensors", "config.yaml")  # files the converted weights are derived from
 NEG_INF = -1e9  # additive mask value; finite so fully-masked rows stay NaN-free
 
 
@@ -197,10 +201,12 @@ class MLXDecisionModel:
     def load(cls, run_dir, dtype=mx.float32, encoder: str = "own"):
         run_dir = Path(run_dir)
         path = run_dir / WEIGHTS
-        if not path.exists():
+        reason = stale_reason(run_dir)
+        if reason:
+            print(f"[mlx] {run_dir}: {reason}; converting (needs torch + the base HF model)", file=sys.stderr)
             convert(run_dir)
         w = mx.load(str(path))
-        cfg = json.loads((run_dir / "mlx_text_config.json").read_text())
+        cfg = json.loads((run_dir / CONFIG).read_text())
         enc = {k[len("encoder."):]: v for k, v in w.items() if k.startswith("encoder.")}
         head = {k[len("head."):]: v for k, v in w.items() if k.startswith("head.")}
         return cls(enc, head, cfg, dtype, encoder)
@@ -225,6 +231,65 @@ class MLXDecisionModel:
         return np.array(p)
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stat_key(path: Path) -> dict:
+    st = path.stat()
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def source_provenance(run_dir) -> dict:
+    """Fingerprint of the checkpoint files the MLX weights are derived from: size + mtime_ns (cheap, checked on
+    every load) plus SHA-256 (only consulted when size/mtime differ, so a copied/rsynced run dir whose mtimes
+    changed but whose bytes did not is not reconverted)."""
+    run_dir = Path(run_dir)
+    return {"format": CONVERT_FORMAT,
+            "sources": {n: {**_stat_key(run_dir / n), "sha256": _sha256(run_dir / n)} for n in SOURCES}}
+
+
+def stale_reason(run_dir) -> str | None:
+    """None if runs/<run>/mlx_text.* is up to date with its source checkpoint, else a short reason to reconvert."""
+    run_dir = Path(run_dir)
+    if not (run_dir / WEIGHTS).exists():
+        return f"{WEIGHTS} is missing"
+    cfg_path = run_dir / CONFIG
+    if not cfg_path.exists():
+        return f"{CONFIG} is missing"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except ValueError:
+        return f"{CONFIG} is unreadable"
+    prov = cfg.get("provenance")
+    if not isinstance(prov, dict) or prov.get("format") != CONVERT_FORMAT:
+        return "converted weights have no (or an old) provenance record"
+    recorded = prov.get("sources") or {}
+    refreshed = False
+    for name in SOURCES:
+        src = run_dir / name
+        if not src.exists():
+            return f"source {name} is missing"
+        rec = recorded.get(name)
+        if not rec:
+            return f"no provenance recorded for {name}"
+        cur = _stat_key(src)
+        if cur["size"] != rec.get("size"):
+            return f"{name} changed (size)"
+        if cur["mtime_ns"] != rec.get("mtime_ns"):
+            if _sha256(src) != rec.get("sha256"):
+                return f"{name} changed (content)"
+            rec.update(cur)  # same bytes, new mtime: remember it so the hash is not recomputed next time
+            refreshed = True
+    if refreshed:
+        cfg_path.write_text(json.dumps(cfg, indent=1))
+    return None
+
+
 def convert(run_dir) -> Path:
     """Write runs/<run>/mlx_text.safetensors (text encoder + head) from the trained PyTorch run."""
     import torch
@@ -245,7 +310,9 @@ def convert(run_dir) -> Path:
         out[f"encoder.{k}"] = mx.array(v.detach().to(torch.float32).numpy())
     for k, v in model.head.state_dict().items():
         arr = v.detach().cpu()
-        out[f"head.{k}"] = mx.array(arr.numpy() if arr.dtype != torch.float32 else arr.numpy())
+        if arr.is_floating_point():  # numpy has no bf16/fp16-safe path via .numpy(); fp32 is lossless for all of them
+            arr = arr.to(torch.float32)
+        out[f"head.{k}"] = mx.array(arr.numpy())  # non-float buffers (e.g. int64) keep their dtype
     mx.save_safetensors(str(run_dir / WEIGHTS), out)
     tc = lm.config.to_dict()
     keep = ("num_hidden_layers", "hidden_size", "hidden_size_per_layer_input", "num_attention_heads", "head_dim",
@@ -253,7 +320,8 @@ def convert(run_dir) -> Path:
             "embedding_dim", "pad_token_id")
     cfg_out = {k: tc[k] for k in keep}
     cfg_out["per_layer_config"] = {k: v for k, v in (tc.get("per_layer_config") or {}).items() if str(k).isdigit()}
-    (run_dir / "mlx_text_config.json").write_text(json.dumps(cfg_out, indent=1))
+    cfg_out["provenance"] = source_provenance(run_dir)  # written last: its presence marks a complete conversion
+    (run_dir / CONFIG).write_text(json.dumps(cfg_out, indent=1))
     print(f"wrote {run_dir / WEIGHTS} ({sum(v.size for v in out.values()) / 1e6:.0f}M params)")
     return run_dir / WEIGHTS
 
