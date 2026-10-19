@@ -420,9 +420,11 @@ def load_pilot_examples(root, split: str = "train", sources: list[str] | None = 
 
     import pyarrow.parquet as pq
 
+    from fnmatch import fnmatch
+
     out = []
     for path in sorted(Path(root, split).glob("*.parquet")):
-        if sources and path.stem not in sources:
+        if sources and not any(fnmatch(path.stem, s) for s in sources):  # names or patterns ("bk_*")
             continue
         for row in pq.read_table(path).to_pylist():
             renderings = {v: row[f"state_{v}"] for v in row["variants"]}

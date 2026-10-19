@@ -230,6 +230,35 @@ def test_s1mb_render_anonymizes_choice_and_orders_score():
     assert case_from_row(row, "noul")["questions"][0]["id"] == "urgent"
 
 
+def test_broad_convert_matches_pilot_schema():
+    import json as _json
+
+    from gemma_decision.broad_build import convert
+    from gemma_decision.data import row_to_example
+
+    row = _s1_row([_s1_decision("answer", "choice", [("A", "yes", None), ("B", "no", None), ("C", "maybe", None)])],
+                  [{"decision_id": "answer", "ids": ["A", "B", "C"], "probabilities": [0.2, 0.0, 0.8]}])
+    (out,) = convert(row, "bk_test", "MIT")
+    assert out["license"] == "MIT" and out["variants"] == ["text"] and out["id"] == "bk_test:c1#0"
+    ex = row_to_example({**out, "state": out["state_text"]})
+    (q,) = ex.questions
+    assert q.name == "decision" and q.keys == ["A", "B", "C"] and q.target == [0.2, 0.0, 0.8] and q.label == 2
+    assert _json.loads(out["gold"])["decision"]["label"] == "C"
+
+
+def test_broad_seen_cases_strips_source_and_part_suffix(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from gemma_decision.broad_build import seen_cases
+
+    (tmp_path / "train").mkdir()
+    ids = ["bk_x:ds:train:1#0", "bk_x:ds:train:2#0", "bk_x:ds:train:2#1", "bk_x:a#b:3#0"]
+    pq.write_table(pa.table({"id": ids}), tmp_path / "train" / "bk_x.parquet")
+    assert seen_cases(tmp_path, "bk_x") == {"ds:train:1", "ds:train:2", "a#b:3"}
+    assert seen_cases(tmp_path, "bk_missing") == set()
+
+
 def test_serve_decide_request_to_example_and_back():
     from gemma_decision.serve import DecideRequest, decide_example, decide_output
 
@@ -278,7 +307,6 @@ def test_serve_pad_batch_buckets_shapes():
     assert p["input_ids"].shape[1] == 64 and p["attention_mask"][0, b["input_ids"].shape[1]:].sum() == 0
     assert p["slot_weights"].shape[1:] == (8, 64) and p["slot_kind"].shape[1] == 8
     assert p["q_opt_mask"].shape[1] == 4 and not p["q_opt_mask"][0, 3]
-
 
 
 def test_mlx_head_matches_torch_head():
