@@ -1,0 +1,24 @@
+# More data: continue `broad` on 1,000 new cases per bekko subset (gd-broad-build --per-source 1000
+# --exclude data/broad --out data/broad2: none of the 500 per subset `broad` trained on, same test files), about
+# twice broad's bekko data, with the same capped replay of the pilot mix, synthetic rows and typed-decisions.
+name: broad2
+mode: full
+init_from: runs/broad
+epochs: 1
+max_length: 3072          # 99% of S1MB inputs fit; longer training states are cut at the end
+lr_encoder: 2.0e-5
+lr_head: 1.0e-4
+select_by: typed_kl
+max_batch_tokens: 6000
+save_every_steps: 300
+mix:
+  pilot_dir: [data/broad2, data/pilot, data/synth]
+  sources: ["bk_*", banking77, clinc, massive, mnli, fleurs, slurp, minds14, belebele_fleurs, cremad,
+            textvqa, gqa, eurosat, oxford_pets, cord, valen,
+            catch_all_typed, flip_typed, missing_typed, catch_all_pilot]   # synthetic rows are never capped
+  source_caps: {banking77: 150, clinc: 150, massive: 150, mnli: 150, fleurs: 150, slurp: 150, minds14: 150,
+                belebele_fleurs: 150, cremad: 150, textvqa: 150, gqa: 150, eurosat: 150, oxford_pets: 150,
+                cord: 150, valen: 300}
+  typed_repeat: 2
+  holdout: 0.03
+  weights: {media: 0.5, both: 0.3, text: 0.2}

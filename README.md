@@ -124,6 +124,37 @@ multimodal training data before it says anything about decisions.
 `data/pilot/{train,test}`; see `docs/dataset-candidates.md`. `configs/pilot_full.yaml` trains on
 typed-decisions x3 plus the pilot, picking a text / media / both rendering per row each epoch.
 
+## Broad training (bekko) and S1MB
+
+`gd-broad-build` samples text decision cases from
+[hotchpotch/bekko-system-one-dataset-v0](https://huggingface.co/datasets/hotchpotch/bekko-system-one-dataset-v0)
+subsets whose upstream license is commercial-safe (124 used, 29 excluded; see `SAFE_LICENSES`), drops any case
+that shares an input hash or group with the S1MB English test set, and renders them like S1MB inputs.
+`--exclude <previous build>` skips cases a previous build trained on and reuses its test files.
+
+```bash
+uv run gd-broad-build --per-source 500 --out data/broad                              # broad
+uv run gd-broad-build --per-source 1000 --exclude data/broad --out data/broad2       # broad2: 106k new cases
+uv run gd-train configs/broad2.yaml                                                  # ~19 h on the M1 Max
+uv run python scripts/s1mb_bench.py runs/broad2 && uv run python scripts/s1mb_leaderboard.py runs/broad2
+```
+
+`broad` continues `continue_synth` on 500 cases per subset; `broad2` continues `broad` on 1,000 new ones per
+subset; both replay the pilot mix, synthetic rows and typed-decisions. S1MB English v1 (137 benchmarks, cohort of
+168 published models; G = the generalization benchmarks):
+
+| run | rank | Borda | Task Avg | Noul | Choice | Score | G Noul | G Choice | G Score |
+|---|---|---|---|---|---|---|---|---|---|
+| continue_synth | 148 | 19.9 | 8.4 | 6.4 | 15.2 | 3.5 | 18.0 | 44.4 | 3.9 |
+| broad | 118 | 36.2 | 25.2 | 24.2 | 31.3 | 20.2 | 15.0 | 43.8 | 6.5 |
+| **broad2** | **106** | **42.4** | **30.0** | **32.3** | **34.7** | **23.1** | **30.0** | 39.3 | 4.1 |
+| bekko-system-one-v0-68m | 79 | 55.9 | 40.5 | 42.9 | 51.6 | 26.9 | 31.0 | 57.5 | 8.9 |
+| bekko-system-one-v0-400m | 41 | 67.4 | 50.6 | 51.2 | 61.3 | 39.3 | 52.0 | 80.3 | 31.1 |
+
+broad -> broad2 on the shared tests: typed-decisions acc 0.763 -> 0.768 (KL 0.100 -> 0.095); per-source test
+(18,450 questions, identical files) acc 0.671 -> 0.689, bekko subsets 0.573 -> 0.616 (macro), image/audio
+sources within ±2.5 pp. Gains are mostly in-domain: generalization Choice and Score went down.
+
 ## Training on Modal (`modal_app.py`)
 
 ```bash
