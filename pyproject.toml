@@ -2,6 +2,8 @@
 name = "gemma-decision"
 version = "0.1.0"
 description = "Clef-style decision model on an EmbeddingGemma-2 encoder"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Lucas Bessa" }
 ]

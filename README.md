@@ -237,3 +237,12 @@ uv run gd-serve --run runs/broad --host 0.0.0.0   # reachable from the network; 
 - Precision: fp32. `float16` breaks EmbeddingGemma-2 (per the model card); bf16 gave no speedup on M1.
 - `config.json` says the sliding window is 512 (the model card says 1024).
 - Requires `transformers>=5.19` (model type `embedding_gemma2`).
+
+## License
+
+This repository's original code is licensed under the [MIT License](LICENSE).
+[EmbeddingGemma-2](https://ai.google.dev/gemma/docs/embeddinggemma) is licensed under
+[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). When redistributing its weights or
+modified weights, include the Apache license, retain the required notices and identify your changes.
+Dependencies and datasets retain their own licenses; the MIT license covers this repository's
+original code.
